@@ -1,0 +1,20 @@
+# Build artifacts
+build-system/arch/output/
+build-system/catalyst/output/
+*.qcow2
+*.tar.xz
+*.img
+*.iso
+*.log
+
+# Temporary files
+/tmp/regicide-*
+/tmp/ovmf-*.fd
+/tmp/websockify*.log
+*.png
+*.ppm
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
