@@ -9,7 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TARBALL=""
 OUTPUT="${SCRIPT_DIR}/output/regicide-arch.qcow2"
-DISK_SIZE="20G"
+DISK_SIZE="${REGICIDE_DISK_SIZE:-20G}"
+EFI_SIZE="${REGICIDE_EFI_SIZE:-512M}"
+ROOTS_SIZE="${REGICIDE_ROOTS_SIZE:-12G}"
+OVERLAY_SIZE="${REGICIDE_OVERLAY_SIZE:-4G}"
 ENCRYPT=false
 PASSPHRASE_FILE=""
 POS=0
@@ -122,10 +125,10 @@ qemu-img create -f raw "${RAW_IMG}" "${DISK_SIZE}"
 
 echo "Partitioning disk image..."
 sgdisk --clear "${RAW_IMG}"
-sgdisk --new=1:0:+512M   --typecode=1:ef00 --change-name=1:EFI     "${RAW_IMG}"
-sgdisk --new=2:0:+12G    --typecode=2:8300 --change-name=2:ROOTS   "${RAW_IMG}"
-sgdisk --new=3:0:+4G     --typecode=3:8300 --change-name=3:OVERLAY "${RAW_IMG}"
-sgdisk --new=4:0:0       --typecode=4:8300 --change-name=4:HOME    "${RAW_IMG}"
+sgdisk --new=1:0:+"${EFI_SIZE}"   --typecode=1:ef00 --change-name=1:EFI     "${RAW_IMG}"
+sgdisk --new=2:0:+"${ROOTS_SIZE}"  --typecode=2:8300 --change-name=2:ROOTS   "${RAW_IMG}"
+sgdisk --new=3:0:+"${OVERLAY_SIZE}" --typecode=3:8300 --change-name=3:OVERLAY "${RAW_IMG}"
+sgdisk --new=4:0:0         --typecode=4:8300 --change-name=4:HOME    "${RAW_IMG}"
 
 # Partition indexes for guestfish (1-based)
 EFI_IDX=1

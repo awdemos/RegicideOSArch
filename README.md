@@ -28,6 +28,8 @@
 
 ## 🏗️ Architecture
 
+> **Target note**: The current package set is optimized for the bootable QCOW2 VM image. A future ISO/bare-metal profile will diverge where needed. You can make this ISO-friendly by removing the following packages from the default install: `qemu-guest-agent`, `spice-vdagentd`, and the full `linux-firmware` bundle (replace it with targeted `linux-firmware-*` split packages such as `linux-firmware-iwlwifi`, `linux-firmware-rtw88`, `amd-ucode`, and `intel-ucode`).
+
 | Component | Technology | Purpose | Status |
 |-----------|------------|---------|--------|
 | Base distro | Arch Linux | Rolling binary distribution | ✅ Working |
@@ -37,8 +39,9 @@
 | Bootloader | systemd-boot (unencrypted) / GRUB (encrypted) | UEFI boot | ✅ Working |
 | Desktop | COSMIC (official `extra` group) | Wayland-native GPU desktop | ✅ Working |
 | Container Runtime | podman + distrobox | Rootless containers and distro compatibility | ✅ Working |
-| GPU | NVIDIA open-source driver (`nvidia-open-dkms`) | Proprietary-free NVIDIA stack | ✅ Installed |
+| GPU | NVIDIA open-source driver (`nvidia-open-dkms`) | Proprietary-free NVIDIA stack; optional via `--no-nvidia` | ✅ Optional |
 | Terminal | Rio (Flatpak) | GPU-accelerated terminal | ✅ Working |
+| Packages | `build-system/packages/*.txt` | Shared package lists for VM/container variants | ✅ Added |
 
 ### Directory Layout
 
@@ -50,6 +53,8 @@ build-system/
 │   ├── build-qemu-image-guestmount.sh # FUSE/guestmount GRUB builder
 │   ├── post-install.sh                # Services, initramfs, users, flatpak
 │   └── output/                        # Generated images and runner scripts
+├── packages/                          # Shared package lists (VM, future ISO)
+│   └── vm.txt                         # Default VM package set
 ├── dagger_pipeline.py                 # Dagger orchestration
 └── README.md                          # Build-system reference
 ```
@@ -121,13 +126,42 @@ Then open `http://localhost:6081/vnc.html?host=localhost&port=6081&autoconnect=t
 
 > **Default credentials**: `regicide` / `regicide`. Root password is also `regicide`; change it immediately on first boot.
 
-#### 4. Encrypted build (optional)
+#### 4. Build options
+
+| Flag | Purpose |
+|------|---------|
+| `--no-nvidia` | Skip the NVIDIA open-source driver stack (useful for CPU-only VMs or ISO prep). |
+| `--no-defer-flatpaks` | Install all Flatpak apps during the image build instead of on first boot. |
+| `--qcow2-size SIZE` | Set the output disk size, e.g. `30G` (default: `20G`). |
+| `--qcow2-output PATH` | Set a custom output path for the QCOW2 image. |
+
+Examples:
 
 ```bash
+# Slim CPU-only VM image with no NVIDIA drivers and all Flatpaks pre-installed
+DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --qcow2 --no-nvidia --no-defer-flatpaks
+
+# Encrypted build (uses GRUB + LUKS2; prompts for a passphrase)
 DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --encrypt
 ```
 
-This exports the tarball and runs the loop-device GRUB/LUKS2 builder. You will be prompted for a LUKS passphrase.
+#### 5. Image builder environment variables
+
+The QCOW2 builders read optional environment variables to size partitions. Defaults preserve the original layout.
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `REGICIDE_DISK_SIZE` | `20G` | Total raw disk size before QCOW2 conversion. |
+| `REGICIDE_EFI_SIZE` | `512M` | EFI system partition. |
+| `REGICIDE_ROOTS_SIZE` | `14G` (`12G` for encrypted builds) | Btrfs root partition. Increase if pre-installing many packages. |
+| `REGICIDE_OVERLAY_SIZE` | `4G` | Overlay upperdir partition for writable `/etc`, `/var`, `/usr`. |
+
+Example:
+
+```bash
+REGICIDE_ROOTS_SIZE=20G REGICIDE_OVERLAY_SIZE=8G \
+  DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --qcow2
+```
 
 ---
 

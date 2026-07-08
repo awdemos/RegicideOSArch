@@ -6,7 +6,6 @@ systemctl enable NetworkManager || true
 systemctl enable cups || true
 systemctl enable systemd-timesyncd || true
 systemctl enable cosmic-greeter || true
-systemctl enable lvm2-monitor || true
 systemctl enable qemu-guest-agent || true
 systemctl enable spice-vdagentd || true
 systemctl enable sshd || true
@@ -15,3 +14,5 @@ systemctl enable sshd || true
 ssh-keygen -A || true
 
 systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service || true
+
+systemctl enable regicide-rollback-apply.service || true

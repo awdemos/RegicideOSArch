@@ -13,7 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TARBALL=""
 OUTPUT="${SCRIPT_DIR}/output/regicide-arch.qcow2"
-DISK_SIZE="20G"
+DISK_SIZE="${REGICIDE_DISK_SIZE:-20G}"
+EFI_SIZE="${REGICIDE_EFI_SIZE:-512M}"
+ROOTS_SIZE="${REGICIDE_ROOTS_SIZE:-14G}"
+OVERLAY_SIZE="${REGICIDE_OVERLAY_SIZE:-4G}"
 ENCRYPT=false
 PASSPHRASE_FILE=""
 POS=0
@@ -112,13 +115,10 @@ RAW_IMG="$(mktemp --suffix=.raw)"
 cleanup() {
     echo "Cleaning up..."
     rm -f "${RAW_IMG}" 2>/dev/null || true
-}
-cleanup() {
-    echo "Cleaning up..."
-    rm -f "${RAW_IMG}" 2>/dev/null || true
     rm -f "${PLAIN_TAR}" 2>/dev/null || true
     rm -rf "${UNTARRED_DIR}" 2>/dev/null || true
-    rm -f "${SEED_SCRIPT_TMP}" 2>/dev/null || true
+    rm -f "${SEED_TARBALL}" 2>/dev/null || true
+    rm -f "${SEED_SCRIPT}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -127,10 +127,10 @@ qemu-img create -f raw "${RAW_IMG}" "${DISK_SIZE}"
 
 echo "Partitioning disk image..."
 sgdisk --clear "${RAW_IMG}"
-sgdisk --new=1:0:+512M   --typecode=1:ef00 --change-name=1:EFI     "${RAW_IMG}"
-sgdisk --new=2:0:+14G    --typecode=2:8300 --change-name=2:ROOTS   "${RAW_IMG}"
-sgdisk --new=3:0:+4G     --typecode=3:8300 --change-name=3:OVERLAY "${RAW_IMG}"
-sgdisk --new=4:0:0       --typecode=4:8300 --change-name=4:HOME    "${RAW_IMG}"
+sgdisk --new=1:0:+"${EFI_SIZE}"   --typecode=1:ef00 --change-name=1:EFI     "${RAW_IMG}"
+sgdisk --new=2:0:+"${ROOTS_SIZE}"  --typecode=2:8300 --change-name=2:ROOTS   "${RAW_IMG}"
+sgdisk --new=3:0:+"${OVERLAY_SIZE}" --typecode=3:8300 --change-name=3:OVERLAY "${RAW_IMG}"
+sgdisk --new=4:0:0         --typecode=4:8300 --change-name=4:HOME    "${RAW_IMG}"
 
 EFI_IDX=1
 ROOTS_IDX=2
@@ -179,6 +179,7 @@ guestfish <<GFISH
   mkdir-p /overlay
   mkdir-p /home
   mkdir-p /boot/efi
+  mkdir-p /tmp
 GFISH
 
 rm -f "${PLAIN_TAR}"
@@ -228,56 +229,68 @@ fi
 rm -f /tmp/guestfish-verify.log
 
 echo "Pre-seeding overlay upperdir directory trees to prevent overlayfs EXDEV..."
-SEED_SCRIPT_TMP="$(mktemp)"
-cat > "${SEED_SCRIPT_TMP}" << 'SEEDEOF'
-#!/bin/bash
-# Seed directory trees (without file contents) from the read-only ROOTS
-# partition into the overlay upperdirs so that overlayfs never has to
-# copy-up a parent directory during runtime writes. This avoids EXDEV
-# errors for operations like pacman -Sy or systemd StateDirectory=.
-set -e
-SRC_ROOT="${1:-/roots}"
-OVERLAY_ROOT="${2:-/}"
-for dir in etc var usr; do
-    if [[ ! -d "${SRC_ROOT}/${dir}" ]]; then
-        continue
-    fi
-    echo "Seeding directory tree for /${dir} ..."
-    list="/tmp/${dir}_dirs.txt"
-    cd "${SRC_ROOT}/${dir}"
-    find . -type d -print0 > "${list}"
-    cd "${OVERLAY_ROOT}"
-    while IFS= read -r -d '' d; do
-        mkdir -p "${OVERLAY_ROOT}/${dir}/${d}"
-    done < "${list}"
-    while IFS= read -r -d '' d; do
-        src="${SRC_ROOT}/${dir}/${d}"
-        dst="${OVERLAY_ROOT}/${dir}/${d}"
-        if [[ -L "${src}" ]]; then
-            rm -f "${dst}"
-            ln -sfn "$(readlink "${src}")" "${dst}"
+SEED_TARBALL="$(mktemp --suffix=.tar)"
+SEED_SCRIPT="$(mktemp)"
+cat > "${SEED_SCRIPT}" <<'PYEOF'
+import os
+import sys
+import tarfile
+
+src_path = sys.argv[1]
+out_path = sys.argv[2]
+
+dirs_to_seed = {"etc", "var", "usr"}
+added = set()
+
+def should_skip_symlink(m):
+    if not m.issym():
+        return False
+    top = m.name.split("/", 1)[0]
+    # /var contains symlinks that escape the overlay (run, lock, tmp). Skip all
+    # symlinks there so the overlay can provide real directories instead.
+    if top == "var":
+        return True
+    target = (m.linkname or "").strip()
+    # Skip absolute symlinks that escape their top-level directory.
+    if target.startswith("/") and not target.startswith("/" + top + "/"):
+        return True
+    return False
+
+with tarfile.open(src_path, "r") as src, tarfile.open(out_path, "w") as out:
+    for member in src.getmembers():
+        top = member.name.split("/", 1)[0]
+        if top not in dirs_to_seed:
             continue
-        fi
-        chown "$(stat -c %u:%g "${src}")" "${dst}"
-        chmod "$(stat -c %a "${src}")" "${dst}"
-    done < "${list}"
-done
-mkdir -p "${OVERLAY_ROOT}/etcw" "${OVERLAY_ROOT}/varw" "${OVERLAY_ROOT}/usrw"
-chmod 755 "${OVERLAY_ROOT}/etcw" "${OVERLAY_ROOT}/varw" "${OVERLAY_ROOT}/usrw"
-echo "Done seeding overlay directory trees."
-SEEDEOF
-chmod +x "${SEED_SCRIPT_TMP}"
+        if not member.isdir() and not member.issym():
+            continue
+        if should_skip_symlink(member):
+            continue
+        if member.name in added:
+            continue
+        added.add(member.name)
+        out.addfile(member)
+
+    for extra in ["etcw", "varw", "usrw"]:
+        info = tarfile.TarInfo(extra)
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        info.uid = 0
+        info.gid = 0
+        out.addfile(info)
+PYEOF
+python3 "${SEED_SCRIPT}" "${TARBALL}" "${SEED_TARBALL}"
+rm -f "${SEED_SCRIPT}"
 
 guestfish <<GFISH
   add-drive "${RAW_IMG}" format:raw
   run
   mount "/dev/sda${OVERLAY_IDX}" /
-  mkdir-p /roots
-  mount "/dev/sda${ROOTS_IDX}" /roots
-  upload "${SEED_SCRIPT_TMP}" /tmp/seed-overlays.sh
-  command "bash /tmp/seed-overlays.sh /roots /"
-  umount /roots
+  tar-in "${SEED_TARBALL}" /
+  umount /
 GFISH
+
+rm -f "${SEED_TARBALL}"
+echo "Done seeding overlay directory trees."
 
 echo "Writing /etc/fstab inside guestfish..."
 FSTAB_TMP="$(mktemp)"

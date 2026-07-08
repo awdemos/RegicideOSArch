@@ -11,18 +11,65 @@ fi
 
 flatpak remote-add --system flathub https://flathub.org/repo/flathub.flatpakrepo || true
 
-HOST_FLATPAKS=(
-    com.protonvpn.www
+# Rio is the only Flatpak app required for a usable desktop out of the box.
+# The rest are heavy and are installed on first boot unless deferral is disabled.
+ESSENTIAL_FLATPAKS=(
     com.rioterm.Rio
+)
+DEFERRED_FLATPAKS=(
+    com.protonvpn.www
     dev.zed.Zed
     io.github.dvlv.boxbuddyrs
     io.github.ungoogled_software.ungoogled_chromium
     org.gnome.SoundRecorder
     org.virt_manager.virt-manager
 )
-for app in "${HOST_FLATPAKS[@]}"; do
+
+for app in "${ESSENTIAL_FLATPAKS[@]}"; do
     flatpak install --system --noninteractive --assumeyes flathub "$app" || true
 done
+
+if [[ "${REGICIDE_DEFER_FLATPAKS:-1}" == "1" ]]; then
+    echo "Deferring heavy Flatpak apps to first-boot service"
+    mkdir -p /usr/lib/regicide
+    cat > /usr/lib/regicide/install-deferred-flatpaks.sh <<'EOF_DEFER'
+#!/bin/bash
+set -euo pipefail
+flatpak remote-add --system flathub https://flathub.org/repo/flathub.flatpakrepo || true
+for app in \
+    com.protonvpn.www \
+    dev.zed.Zed \
+    io.github.dvlv.boxbuddyrs \
+    io.github.ungoogled_software.ungoogled_chromium \
+    org.gnome.SoundRecorder \
+    org.virt_manager.virt-manager; do
+    flatpak install --system --noninteractive --assumeyes flathub "$app" || true
+done
+EOF_DEFER
+    chmod +x /usr/lib/regicide/install-deferred-flatpaks.sh
+
+    cat > /etc/systemd/system/regicide-deferred-flatpaks.service <<'EOF_SERVICE'
+[Unit]
+Description=Install deferred Flatpak applications on first boot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/regicide/deferred-flatpaks.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/regicide/install-deferred-flatpaks.sh
+ExecStartPost=/usr/bin/touch /var/lib/regicide/deferred-flatpaks.done
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+    systemctl enable regicide-deferred-flatpaks.service || true
+else
+    for app in "${DEFERRED_FLATPAKS[@]}"; do
+        flatpak install --system --noninteractive --assumeyes flathub "$app" || true
+    done
+fi
 
 # Rio (com.rioterm.Rio) fails to start under COSMIC when launched from the
 # app grid because it cannot determine a controlling TTY. Flatpak also strips

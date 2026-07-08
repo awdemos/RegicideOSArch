@@ -29,8 +29,17 @@ def _cpu_count() -> int:
     return os.cpu_count() or 4
 
 
+def _load_package_list(name: str) -> list[str]:
+    """Read a newline-separated package list, skipping blanks and comments."""
+    path = Path(__file__).parent / "packages" / f"{name}.txt"
+    with path.open("r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
 async def build_arch_cosmic(
     client: dagger.Client,
+    enable_nvidia: bool = True,
+    defer_flatpaks: bool = True,
     arch: str = "amd64",
     variant: str = "systemd",
 ) -> dagger.Container:
@@ -46,6 +55,12 @@ async def build_arch_cosmic(
             "*.tar.xz",
             "*.tar",
             "*.qcow2",
+            "*.vdi",
+            "*.raw",
+            "*.log",
+            ".serena/",
+            ".env",
+            ".env.*",
         ],
     )
 
@@ -72,54 +87,49 @@ async def build_arch_cosmic(
             "pacman -S --noconfirm reflector || true; "
             "reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || true; "
             "sed -i 's/^#DisableDownloadTimeout/DisableDownloadTimeout/' /etc/pacman.conf || true; "
-            "grep -q '^DisableDownloadTimeout' /etc/pacman.conf || echo 'DisableDownloadTimeout' >> /etc/pacman.conf",
+            "grep -q '^DisableDownloadTimeout' /etc/pacman.conf || echo 'DisableDownloadTimeout' >> /etc/pacman.conf; "
+            "cat >> /etc/pacman.conf <<'EOF'\n"
+            "NoExtract = usr/share/doc/*\n"
+            "NoExtract = usr/share/man/*\n"
+            "NoExtract = usr/share/info/*\n"
+            "NoExtract = usr/share/help/*\n"
+            "NoExtract = usr/share/gtk-doc/html/*\n"
+            "EOF",
         ])
     )
 
+    # Default VM profile enables the NVIDIA stack and defers heavy Flatpak apps
+    # to first boot. Override with --no-nvidia / --defer-flatpaks=false as needed.
+    nvidia_flag = "1" if enable_nvidia else "0"
+    flatpaks_flag = "1" if defer_flatpaks else "0"
+
+    vm_packages = _load_package_list("vm")
     with_rootfs = with_keyring.with_exec(
-        [
-            "pacman", "-S", "--needed", "--noconfirm", "--disable-download-timeout",
-            "base",
-            "base-devel",
-            "btrfs-progs",
-            "cryptsetup",
-            "dosfstools",
-            "efibootmgr",
-            "grub",
-            "linux",
-            "linux-firmware",
-            "mkinitcpio",
-            "networkmanager",
-            "pipewire",
-            "pipewire-alsa",
-            "pipewire-jack",
-            "pipewire-pulse",
-            "wireplumber",
-            "cosmic",
-            "flatpak",
-            "xdg-utils",
-        ]
+        ["pacman", "-S", "--needed", "--noconfirm", "--disable-download-timeout"]
+        + vm_packages
     )
 
     with_post = (
         with_rootfs
         .with_directory("/src", src)
-        .with_exec(["cp", "/src/build-system/arch/post-install.sh", "/tmp/post-install.sh"])
-        .with_exec(["bash", "/tmp/post-install.sh"])
+        .with_exec(["cp", "-r", "/src/build-system/arch", "/tmp/regicide-arch-build"])
+        .with_exec(
+            [
+                "bash", "-c",
+                f"REGICIDE_ENABLE_NVIDIA={nvidia_flag} "
+                f"REGICIDE_DEFER_FLATPAKS={flatpaks_flag} "
+                "SRC_DIR=/src bash /tmp/regicide-arch-build/post-install.sh",
+            ]
+        )
     )
 
-    with_initramfs = with_post.with_exec(
-        [
-            "bash", "-c",
-            "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
-            "mkinitcpio -P",
-        ]
-    )
+    # post-install.d/99-finalize.sh already runs mkinitcpio -P; the encrypted
+    # image builder also runs it inside the chroot. Do not regenerate it here.
 
     # Compress the intermediate tarball with xz. The extra CPU cost is
     # acceptable because it drastically reduces export time and the
     # downstream QCOW2 builders consume the .tar.xz format directly.
-    return with_initramfs.with_exec(
+    return with_post.with_exec(
         [
             "bash", "-c",
             f"mkdir -p {rootfs_dir} && "
@@ -253,6 +263,23 @@ async def main() -> None:
         help="Output path for the optional QCOW2 image (default: build-system/arch/output/regicide-arch.qcow2)",
     )
     parser.add_argument(
+        "--no-nvidia",
+        action="store_true",
+        help="Skip installing the NVIDIA open-source driver stack",
+    )
+    parser.add_argument(
+        "--defer-flatpaks",
+        action="store_true",
+        default=True,
+        help="Defer heavy Flatpak apps to a first-boot service (default: true)",
+    )
+    parser.add_argument(
+        "--no-defer-flatpaks",
+        dest="defer_flatpaks",
+        action="store_false",
+        help="Install all Flatpak apps during image build instead of on first boot",
+    )
+    parser.add_argument(
         "--from-tarball",
         type=Path,
         default=None,
@@ -286,7 +313,11 @@ async def main() -> None:
     async with dagger.Connection(config) as client:
         if tarball_path is None:
             print("Building RegicideOSArch COSMIC rootfs...")
-            build_container = await build_arch_cosmic(client)
+            build_container = await build_arch_cosmic(
+                client,
+                enable_nvidia=not args.no_nvidia,
+                defer_flatpaks=args.defer_flatpaks,
+            )
             tarball = build_container.file("/var/tmp/regicide-arch.tar.xz")
         else:
             print(f"Using existing stage4 tarball: {tarball_path}")
