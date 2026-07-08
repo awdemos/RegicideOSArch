@@ -165,6 +165,60 @@ REGICIDE_ROOTS_SIZE=20G REGICIDE_OVERLAY_SIZE=8G \
 
 ---
 
+## 🔄 System Maintenance & Updates
+
+RegicideOSArch ships with a small update/rollback toolkit installed in the image. These tools operate on the Btrfs `/overlay` subvolumes (`etc`, `var`, `usr`) and snapshot them under `/roots/.regicide-snapshots`. All commands require root privileges.
+
+### Package management
+
+Use `regicide-update` instead of running `pacman` directly so every transaction is snapshotted and can be rolled back:
+
+```bash
+# Sync package databases
+sudo regicide-update sync
+
+# Upgrade all installed packages
+sudo regicide-update upgrade
+
+# Install or remove packages
+sudo regicide-update install rio firefox
+sudo regicide-update remove firefox
+```
+
+If a transaction fails, `regicide-update` automatically schedules a revert to the pre-transaction snapshot; reboot to roll back.
+
+### Snapshot rollback
+
+```bash
+# List available snapshot sets
+sudo regicide-rollback list
+
+# Revert to a snapshot at the next boot
+sudo regicide-rollback revert 2026-07-08_12:00:00_pre_upgrade
+
+# Cancel a pending revert
+sudo regicide-rollback revert --cancel
+```
+
+The `regicide-rollback-apply.service` applies the chosen snapshot before `/etc`, `/var`, and `/usr` are mounted.
+
+### Rootfs update
+
+To replace the base rootfs with a newer release tarball:
+
+```bash
+# Download a release image
+sudo regicide-image fetch https://example.com/regicide-arch.tar.xz \
+  --checksum-url https://example.com/regicide-arch.tar.xz.sha256
+
+# Install it into /roots
+sudo regicide-image install /var/cache/regicide-image/regicide-arch.tar.xz
+```
+
+This extracts the tarball into `/roots` and reseeds the overlay subvolumes so the next boot uses the new base system while preserving user data on the HOME partition.
+
+---
+
 ## 🤖 AI-Agent Build Procedure
 
 Deterministic steps an AI agent can follow. All paths assume the repo was cloned into the current working directory.
