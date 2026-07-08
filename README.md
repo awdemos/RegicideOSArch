@@ -2,7 +2,7 @@
 
 # 🖥️ RegicideOSArch
 
-### Arch Linux side-project of RegicideOS · COSMIC Desktop · AI-Native experiments
+### Arch Linux spin of RegicideOS · COSMIC Desktop · AI-Native experiments
 
 > *Converge and conquer — on Arch.*
 
