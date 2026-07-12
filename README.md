@@ -6,7 +6,7 @@
 
 > *Converge and conquer — on Arch.*
 
-> ⚠️ **Development Status**: The Dagger build pipeline produces a bootable Arch-based rootfs, SquashFS live image, and QCOW2 VM image. COSMIC boots to a greeter, the `regicide` user can log in, and core apps (podman, distrobox, Rio, NVIDIA open drivers) are pre-installed. This is a side project of the main [RegicideOS](https://github.com/awdemos/RegicideOS) effort and is not the primary distribution.
+> ⚠️ **Development Status**: The Dagger build pipeline produces a bootable Arch-based rootfs, SquashFS live image, and QCOW2 VM image. COSMIC boots to a greeter, the `regicide` user can log in, and core apps (podman, distrobox, Rio, NVIDIA open drivers) are pre-installed. The ARM64 build is tested on NVIDIA Spark. This is a side project of the main [RegicideOS](https://github.com/awdemos/RegicideOS) effort and is not the primary distribution.
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-1793D1?style=for-the-badge&logo=arch-linux&logoColor=white)](https://archlinux.org/)
 [![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)

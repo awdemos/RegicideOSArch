@@ -79,7 +79,13 @@ async def build_arch_cosmic(
     )
 
     with_keyring = (
-        base.with_exec(["pacman-key", "--init"])
+        base.with_exec([
+            "bash", "-c",
+            "sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf || true; "
+            "grep -q '^DisableSandbox' /etc/pacman.conf || echo 'DisableSandbox' >> /etc/pacman.conf; "
+            "sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf || true",
+        ])
+        .with_exec(["pacman-key", "--init"])
         .with_exec(["pacman-key", "--populate", "archlinux"])
         .with_exec(["pacman", "-Sy", "--noconfirm", "archlinux-keyring"])
         .with_exec([
