@@ -14,7 +14,21 @@ build-system/catalyst/output/
 *.png
 *.ppm
 
-# Python cache
+# Python cache/build
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+build/
+dist/
+
+# OpenCode session state
+.omo/
+
+# Local runtime logs and VM state
+logs/
+tmp-guestfish/
+*.pid
+
+# Isolated git worktrees
+.worktrees/
