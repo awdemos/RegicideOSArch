@@ -32,3 +32,5 @@ tmp-guestfish/
 
 # Isolated git worktrees
 .worktrees/
+session-*.md
+*.egg-info/
