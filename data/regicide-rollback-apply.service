@@ -1,0 +1,19 @@
+[Unit]
+Description=Apply pending Regicide snapshot revert before overlay mounts
+DefaultDependencies=no
+Before=local-fs-pre.target
+After=systemd-remount-fs.service
+# Skip inside the initramfs: mkinitcpio pulls enabled sysinit units into the
+# image, but python3 only exists in the real root. Without this condition the
+# unit fails at EXEC in the initramfs and blocks local-fs-pre.
+ConditionPathExists=/usr/bin/python3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -m regicide_update.boot_revert
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target
