@@ -27,7 +27,10 @@ import dagger_common
 
 
 def _prompt_luks_passphrase() -> str:
-    """Return the LUKS passphrase from the user, prompting twice."""
+    """Return the LUKS passphrase from the environment or prompt twice."""
+    env_pass = os.environ.get("REGICIDE_LUKS_PASSPHRASE")
+    if env_pass:
+        return env_pass
     while True:
         first = getpass.getpass("Enter LUKS passphrase for encrypted image: ")
         if not first:

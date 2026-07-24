@@ -156,7 +156,22 @@ for bin in podman distrobox flatpak cosmic-session cosmic-greeter btrfs; do
 done
 
 # -----------------------------------------------------------------------------
-log_section "11. NVIDIA userspace stack"
+log_section "11. Minimon GPU/system monitor applet"
+
+if flatpak list --app 2>/dev/null | grep -q "io.github.cosmic_utils.minimon-applet"; then
+    pass "minimon Flatpak installed"
+else
+    fail "minimon Flatpak not installed"
+fi
+
+if [[ -f /var/lib/flatpak/exports/share/applications/io.github.cosmic_utils.minimon-applet.desktop ]]; then
+    pass "minimon desktop entry exported"
+else
+    fail "minimon desktop entry missing"
+fi
+
+# -----------------------------------------------------------------------------
+log_section "12. NVIDIA userspace stack"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
     pass "nvidia-smi installed"
