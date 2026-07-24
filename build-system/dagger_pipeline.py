@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RegicideOSArch Build Pipeline - Dagger orchestration for Arch Linux builds.
+"""RegicideOSArch VM Build Pipeline - Dagger orchestration for Arch Linux builds.
 
 Dagger is used here as an orchestration layer, not a replacement for the
 Arch Linux-based build logic. The actual OS rootfs is built by
@@ -23,110 +23,44 @@ from pathlib import Path
 
 import dagger
 
-
-def _cpu_count() -> int:
-    """Return the number of host CPUs to expose to the build container."""
-    return os.cpu_count() or 4
+import dagger_common
 
 
-def _load_package_list(name: str) -> list[str]:
-    """Read a newline-separated package list, skipping blanks and comments."""
-    path = Path(__file__).parent / "packages" / f"{name}.txt"
-    with path.open("r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+def _prompt_luks_passphrase() -> str:
+    """Return the LUKS passphrase from the user, prompting twice."""
+    while True:
+        first = getpass.getpass("Enter LUKS passphrase for encrypted image: ")
+        if not first:
+            print("Passphrase cannot be empty.")
+            continue
+        second = getpass.getpass("Confirm LUKS passphrase: ")
+        if first != second:
+            print("Passphrases do not match. Try again.")
+            continue
+        return first
 
 
 async def build_arch_cosmic(
     client: dagger.Client,
     enable_nvidia: bool = True,
     defer_flatpaks: bool = True,
-    arch: str = "amd64",
-    variant: str = "systemd",
 ) -> dagger.Container:
     """Build RegicideOSArch COSMIC rootfs in an Arch Linux container."""
 
-    src = client.host().directory(
-        ".",
-        exclude=[
-            ".git/",
-            "build-system/arch/output/",
-            "target/",
-            "*.img",
-            "*.tar.xz",
-            "*.tar",
-            "*.qcow2",
-            "*.vdi",
-            "*.raw",
-            "*.log",
-            ".serena/",
-            ".env",
-            ".env.*",
-        ],
-    )
+    src = dagger_common.project_source_directory(client)
+    base = dagger_common.arch_base_container(client)
+    with_packages = dagger_common.install_packages(base, "vm")
 
-    jobs = _cpu_count()
-    rootfs_dir = "/var/tmp/regicide-root"
-
-    # Cache pacman packages across Dagger runs to avoid re-downloading the world.
-    pacman_cache = client.cache_volume("regicide-arch-pacman")
-
-    # Pin the base image digest to avoid surprise re-downloads on tag drift.
-    base = (
-        client.container()
-        .from_("archlinux:base-devel@sha256:9e9da3122b537ad94f22c8c6f89c1e3f253f3a1e22944364a061c75a041705da")
-        .with_env_variable("MAKEFLAGS", f"-j{jobs}")
-        .with_mounted_cache("/var/cache/pacman/pkg", pacman_cache)
-    )
-
-    with_keyring = (
-        base.with_exec([
-            "bash", "-c",
-            "sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf || true; "
-            "grep -q '^DisableSandbox' /etc/pacman.conf || echo 'DisableSandbox' >> /etc/pacman.conf; "
-            "sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf || true",
-        ])
-        .with_exec(["pacman-key", "--init"])
-        .with_exec(["pacman-key", "--populate", "archlinux"])
-        .with_exec(["pacman", "-Sy", "--noconfirm", "archlinux-keyring"])
-        .with_exec([
-            "bash", "-c",
-            "pacman -S --noconfirm reflector || true; "
-            "reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || true; "
-            "sed -i 's/^#DisableDownloadTimeout/DisableDownloadTimeout/' /etc/pacman.conf || true; "
-            "grep -q '^DisableDownloadTimeout' /etc/pacman.conf || echo 'DisableDownloadTimeout' >> /etc/pacman.conf; "
-            "cat >> /etc/pacman.conf <<'EOF'\n"
-            "NoExtract = usr/share/doc/*\n"
-            "NoExtract = usr/share/man/*\n"
-            "NoExtract = usr/share/info/*\n"
-            "NoExtract = usr/share/help/*\n"
-            "NoExtract = usr/share/gtk-doc/html/*\n"
-            "EOF",
-        ])
-    )
-
-    # Default VM profile enables the NVIDIA stack and defers heavy Flatpak apps
-    # to first boot. Override with --no-nvidia / --defer-flatpaks=false as needed.
     nvidia_flag = "1" if enable_nvidia else "0"
     flatpaks_flag = "1" if defer_flatpaks else "0"
-
-    vm_packages = _load_package_list("vm")
-    with_rootfs = with_keyring.with_exec(
-        ["pacman", "-S", "--needed", "--noconfirm", "--disable-download-timeout"]
-        + vm_packages
-    )
-
-    with_post = (
-        with_rootfs
-        .with_directory("/src", src)
-        .with_exec(["cp", "-r", "/src/build-system/arch", "/tmp/regicide-arch-build"])
-        .with_exec(
-            [
-                "bash", "-c",
-                f"REGICIDE_ENABLE_NVIDIA={nvidia_flag} "
-                f"REGICIDE_DEFER_FLATPAKS={flatpaks_flag} "
-                "SRC_DIR=/src bash /tmp/regicide-arch-build/post-install.sh",
-            ]
-        )
+    with_post = dagger_common.run_post_install(
+        with_packages,
+        src,
+        "post-install.sh",
+        {
+            "REGICIDE_ENABLE_NVIDIA": nvidia_flag,
+            "REGICIDE_DEFER_FLATPAKS": flatpaks_flag,
+        },
     )
 
     # post-install.d/99-finalize.sh already runs mkinitcpio -P; the encrypted
@@ -135,16 +69,10 @@ async def build_arch_cosmic(
     # Compress the intermediate tarball with xz. The extra CPU cost is
     # acceptable because it drastically reduces export time and the
     # downstream QCOW2 builders consume the .tar.xz format directly.
-    return with_post.with_exec(
-        [
-            "bash", "-c",
-            f"mkdir -p {rootfs_dir} && "
-            "tar -cpJf /var/tmp/regicide-arch.tar.xz "
-            "--exclude=/dev --exclude=/proc --exclude=/sys --exclude=/run "
-            "--exclude=/tmp --exclude=/var/tmp --exclude=/src --exclude=/work "
-            "--exclude=/regicide-arch.img --exclude=/regicide-arch.qcow2 "
-            "--exclude=/regicide-arch.tar --exclude=/regicide-arch.tar.xz /",
-        ]
+    return dagger_common.create_rootfs_tarball(
+        with_post,
+        "regicide-arch.tar.xz",
+        compression="xz",
     )
 
 
@@ -173,20 +101,6 @@ async def build_iso(
     )
 
     return builder.file("/tmp/regicide-arch.img")
-
-
-def _prompt_luks_passphrase() -> str:
-    """Return the LUKS passphrase from the user, prompting twice."""
-    while True:
-        first = getpass.getpass("Enter LUKS passphrase for encrypted image: ")
-        if not first:
-            print("Passphrase cannot be empty.")
-            continue
-        second = getpass.getpass("Confirm LUKS passphrase: ")
-        if first != second:
-            print("Passphrases do not match. Try again.")
-            continue
-        return first
 
 
 async def build_qcow2_locally(
@@ -329,13 +243,14 @@ async def main() -> None:
             print(f"Using existing stage4 tarball: {tarball_path}")
             tarball = client.host().file(str(tarball_path))
 
-        out_dir = Path("build-system/arch/output")
+        project_root = Path(__file__).resolve().parent.parent
+        out_dir = project_root / "build-system" / "arch" / "output"
 
         if tarball_path is None:
             print("Exporting stage4 tarball...")
-            await tarball.export(str(out_dir / "regicide-arch.tar.xz"))
-            print("Output: build-system/arch/output/regicide-arch.tar.xz")
             tarball_path = out_dir / "regicide-arch.tar.xz"
+            await tarball.export(str(tarball_path))
+            print(f"Output: {tarball_path}")
 
         squashfs_path = out_dir / "regicide-arch.img"
         if squashfs_input is not None:

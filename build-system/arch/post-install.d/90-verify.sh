@@ -1,5 +1,5 @@
 #!/bin/bash
-# Post-install verification checks for the RegicideOSArch ARM64 VM image.
+# Post-install verification checks for the RegicideOSArch VM image.
 set -euo pipefail
 
 ERRORS=0
