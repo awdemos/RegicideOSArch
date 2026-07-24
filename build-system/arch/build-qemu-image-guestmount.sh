@@ -224,9 +224,9 @@ cat > "${FSTAB_TMP}" << EOF
 LABEL=ROOTS   /       btrfs   defaults,noatime           0 0
 LABEL=OVERLAY /overlay btrfs   defaults,noatime           0 0
 LABEL=HOME    /home   btrfs   defaults,noatime           0 0
-overlay       /etc    overlay lowerdir=/etc,upperdir=/overlay/etc,workdir=/overlay/etcw,x-systemd.requires=/overlay 0 0
-overlay       /var    overlay lowerdir=/var,upperdir=/overlay/var,workdir=/overlay/varw,x-systemd.requires=/overlay 0 0
-overlay       /usr    overlay lowerdir=/usr,upperdir=/overlay/usr,workdir=/overlay/usrw,x-systemd.requires=/overlay 0 0
+overlay       /etc    overlay lowerdir=/etc,upperdir=/overlay/etc,workdir=/overlay/etcw,x-systemd.requires-mounts-for=/overlay 0 0
+overlay       /var    overlay lowerdir=/var,upperdir=/overlay/var,workdir=/overlay/varw,x-systemd.requires-mounts-for=/overlay 0 0
+overlay       /usr    overlay lowerdir=/usr,upperdir=/overlay/usr,workdir=/overlay/usrw,x-systemd.requires-mounts-for=/overlay 0 0
 EOF
 
 guestfish <<GFISH
@@ -245,6 +245,9 @@ guestmount -a "${RAW_IMG}" -m "/dev/sda${ROOTS_IDX}" --rw "${ROOTS_TMP}"
 IS_MOUNTED=true
 
 echo "Mounting EFI and bind-mounting kernel filesystems..."
+# Bind-mount targets may not exist in the extracted rootfs (e.g. empty /dev).
+mkdir -p "${ROOTS_TMP}/dev" "${ROOTS_TMP}/proc" "${ROOTS_TMP}/sys" \
+    "${ROOTS_TMP}/run" "${ROOTS_TMP}/boot/efi"
 guestmount -a "${RAW_IMG}" -m "/dev/sda${EFI_IDX}" --rw "${ROOTS_TMP}/boot/efi"
 mount --bind /dev "${ROOTS_TMP}/dev"
 mount --bind /proc "${ROOTS_TMP}/proc"
@@ -252,7 +255,7 @@ mount --bind /sys "${ROOTS_TMP}/sys"
 mount --bind /run "${ROOTS_TMP}/run"
 
 echo "Running GRUB installation and initramfs rebuild inside chroot..."
-chroot "${ROOTS_TMP}" /bin/bash -c '
+env -u TMPDIR chroot "${ROOTS_TMP}" /bin/bash -c '
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     if [[ ! -f /etc/default/grub ]]; then
