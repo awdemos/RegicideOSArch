@@ -10,37 +10,52 @@ if ! command -v flatpak >/dev/null 2>&1; then
 fi
 
 flatpak remote-add --system flathub https://flathub.org/repo/flathub.flatpakrepo || true
+# COSMIC applets such as Minimon are published in the cosmic Flatpak repo.
+flatpak remote-add --system --if-not-exists cosmic https://apt.pop-os.org/cosmic/cosmic.flatpakrepo || true
 
 # Rio is the only Flatpak app required for a usable desktop out of the box.
 # The rest are heavy and are installed on first boot unless deferral is disabled.
 ESSENTIAL_FLATPAKS=(
     com.rioterm.Rio
+    io.github.ungoogled_software.ungoogled_chromium
 )
 DEFERRED_FLATPAKS=(
     com.protonvpn.www
-    dev.zed.Zed
     io.github.dvlv.boxbuddyrs
-    io.github.ungoogled_software.ungoogled_chromium
     org.gnome.SoundRecorder
     org.virt_manager.virt-manager
 )
 
+mkdir -p /var/log/regicide
+FLATPAK_LOG="/var/log/regicide/flatpak-essential.log"
+: > "${FLATPAK_LOG}"
 for app in "${ESSENTIAL_FLATPAKS[@]}"; do
-    flatpak install --system --noninteractive --assumeyes flathub "$app" || true
+    echo "Installing essential Flatpak: ${app}" | tee -a "${FLATPAK_LOG}"
+    if ! flatpak install --system --noninteractive --assumeyes flathub "${app}" >>"${FLATPAK_LOG}" 2>&1; then
+        echo "ERROR: essential Flatpak install failed: ${app}" | tee -a "${FLATPAK_LOG}"
+        exit 1
+    fi
 done
+
+# Minimon COSMIC applet is distributed from the cosmic Flatpak repo, not Flathub.
+echo "Installing essential Flatpak: io.github.cosmic_utils.minimon-applet (from cosmic repo)" | tee -a "${FLATPAK_LOG}"
+if ! flatpak install --system --noninteractive --assumeyes cosmic io.github.cosmic_utils.minimon-applet >>"${FLATPAK_LOG}" 2>&1; then
+    echo "ERROR: essential Flatpak install failed: io.github.cosmic_utils.minimon-applet" | tee -a "${FLATPAK_LOG}"
+    exit 1
+fi
 
 if [[ "${REGICIDE_DEFER_FLATPAKS:-1}" == "1" ]]; then
     echo "Deferring heavy Flatpak apps to first-boot service"
-    mkdir -p /usr/lib/regicide
+    mkdir -p /usr/lib/regicide /var/lib/regicide
     cat > /usr/lib/regicide/install-deferred-flatpaks.sh <<'EOF_DEFER'
 #!/bin/bash
 set -euo pipefail
 flatpak remote-add --system flathub https://flathub.org/repo/flathub.flatpakrepo || true
+# COSMIC applets such as Minimon are published in the cosmic Flatpak repo.
+flatpak remote-add --system --if-not-exists cosmic https://apt.pop-os.org/cosmic/cosmic.flatpakrepo || true
 for app in \
     com.protonvpn.www \
-    dev.zed.Zed \
     io.github.dvlv.boxbuddyrs \
-    io.github.ungoogled_software.ungoogled_chromium \
     org.gnome.SoundRecorder \
     org.virt_manager.virt-manager; do
     flatpak install --system --noninteractive --assumeyes flathub "$app" || true
