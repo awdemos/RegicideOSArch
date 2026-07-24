@@ -199,6 +199,34 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+log_section "10. regicide-update suite"
+
+for tool in regicide-update regicide-rollback regicide-image regicide-boot-revert; do
+    if command -v "${tool}" >/dev/null 2>&1; then
+        pass "${tool} installed"
+    else
+        fail "${tool} missing"
+    fi
+done
+
+if sudo -n regicide-rollback list >/dev/null 2>&1; then
+    pass "regicide-rollback list works (snapshot store readable)"
+else
+    fail "regicide-rollback list failed"
+fi
+
+if sudo -n regicide-rollback create --tag smoke-test >/dev/null 2>&1; then
+    pass "regicide-rollback snapshot set created"
+    if sudo -n regicide-rollback list | grep -q "smoke-test"; then
+        pass "snapshot set visible in list"
+    else
+        fail "snapshot set not visible in list"
+    fi
+else
+    fail "regicide-rollback snapshot creation failed"
+fi
+
+# -----------------------------------------------------------------------------
 log_section "SUMMARY"
 
 TOTAL=$((PASS + FAIL))
