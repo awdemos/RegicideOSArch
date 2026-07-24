@@ -165,6 +165,39 @@ REGICIDE_ROOTS_SIZE=20G REGICIDE_OVERLAY_SIZE=8G \
 
 ---
 
+## 🪟 WSL Build
+
+A separate Dagger pipeline builds a WSL2-ready rootfs tarball.
+
+### Build the WSL rootfs
+
+```bash
+DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline_wsl.py --plain
+```
+
+Output:
+- `build-system/arch/output/regicide-arch-wsl.tar.gz` — gzip-compressed rootfs for `wsl --import`
+
+### Import into WSL
+
+From Windows PowerShell or CMD:
+
+```powershell
+wsl --import RegicideOSArch C:\WSL\RegicideOSArch \
+  \\wsl$\<distro>\home\<user>\code\personal\RegicideOSArch\build-system\arch\output\regicide-arch-wsl.tar.gz \
+  --version 2
+```
+
+Then start it:
+
+```powershell
+wsl -d RegicideOSArch
+```
+
+> **Default credentials**: `regicide` / `regicide`. `wsl.conf` sets `regicide` as the default user and enables systemd.
+
+---
+
 ## 🔄 System Maintenance & Updates
 
 RegicideOSArch ships with a small update/rollback toolkit installed in the image. These tools operate on the Btrfs `/overlay` subvolumes (`etc`, `var`, `usr`) and snapshot them under `/roots/.regicide-snapshots`. All commands require root privileges.

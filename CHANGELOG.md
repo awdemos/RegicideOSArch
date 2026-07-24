@@ -6,6 +6,10 @@ All notable changes to RegicideOSArch are documented in this file.
 
 ### Added
 
+- Dedicated WSL pipeline `build-system/dagger_pipeline_wsl.py` producing a gzip-compressed rootfs for `wsl --import`.
+- Shared Dagger helpers in `build-system/dagger_common.py` used by both the VM and WSL pipelines.
+- WSL package list at `build-system/packages/wsl.txt` and WSL post-install scripts in `build-system/arch/post-install-wsl.d/`.
+- `/etc/wsl.conf` configuration enabling systemd and setting `regicide` as the default WSL user.
 - Shared package list at `build-system/packages/vm.txt` used by both the Dagger pipeline and the workspace Dockerfile.
 - `--no-nvidia` build flag to skip the NVIDIA open-source driver stack for CPU-only VM images.
 - `--no-defer-flatpaks` build flag to install all Flatpak apps during the image build instead of on first boot.

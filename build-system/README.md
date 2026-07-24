@@ -12,9 +12,14 @@ build-system/
 │   ├── build-qemu-image.sh            # LUKS + Btrfs + GRUB QCOW2 image builder (loop devices)
 │   ├── build-qemu-image-guestfish.sh  # Pure guestfish/systemd-boot QCOW2 builder (no loop devices)
 │   ├── build-qemu-image-guestmount.sh # FUSE/guestmount GRUB QCOW2 builder (no loop devices)
-│   ├── post-install.sh                # Services, initramfs, users, flatpak inside chroot
+│   ├── post-install.sh                # VM post-install orchestrator
+│   ├── post-install.d/                # VM post-install scripts
+│   ├── post-install-wsl.sh            # WSL post-install orchestrator
+│   ├── post-install-wsl.d/            # WSL post-install scripts
 │   └── output/                        # Generated images and QEMU runner scripts
-├── dagger_pipeline.py                 # Dagger orchestration (tarball + SquashFS + optional QCOW2)
+├── dagger_common.py                   # Shared Dagger helpers
+├── dagger_pipeline.py                 # VM pipeline (tarball + SquashFS + optional QCOW2)
+├── dagger_pipeline_wsl.py             # WSL pipeline (gzip rootfs tarball)
 └── README.md                          # This file
 ```
 
@@ -65,6 +70,14 @@ If you already have a `regicide-arch.tar.xz`:
 sudo ./build-system/arch/build-qemu-image.sh --encrypt --passphrase-file /run/luks-passphrase \
   build-system/arch/output/regicide-arch.tar.xz build-system/arch/output/regicide-arch.qcow2 30G
 ```
+
+### Build a WSL Rootfs Tarball
+
+```bash
+dagger run python build-system/dagger_pipeline_wsl.py --plain
+```
+
+This produces `build-system/arch/output/regicide-arch-wsl.tar.gz`, a gzip-compressed rootfs suitable for `wsl --import --version 2`.
 
 ## Dagger Pipeline
 

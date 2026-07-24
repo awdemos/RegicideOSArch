@@ -1,0 +1,15 @@
+base
+btrfs-progs
+networkmanager
+pipewire
+pipewire-alsa
+pipewire-jack
+pipewire-pulse
+wireplumber
+cosmic
+flatpak
+xdg-utils
+podman
+distrobox
+nodejs
+npm
