@@ -106,6 +106,71 @@ async def build_iso(
     return builder.file("/tmp/regicide-arch.img")
 
 
+async def build_live_iso(
+    client: dagger.Client,
+    tarball: dagger.File,
+    squashfs: dagger.File,
+) -> dagger.File:
+    """Create a bootable live ISO (GRUB + dracut dmsquash-live).
+
+    The ISO boots the image kernel with an initramfs that mounts the
+    SquashFS as a read-only live root, so the desktop can be tried or
+    used for installation without touching a disk.
+    """
+    # 1. Generate the live initramfs inside the extracted rootfs so it
+    # matches the exact kernel and userland being shipped. dracut is not in
+    # the Arch image by default, so install it (and squashfs-tools for the
+    # live module's helpers) from the Arch mirrors.
+    initrd_builder = (
+        dagger_common.arch_base_container(client)
+        .with_file("/tmp/regicide-arch.tar.xz", tarball)
+        .with_exec(["sh", "-c", "tar -C / -xpJf /tmp/regicide-arch.tar.xz --exclude=proc --exclude=sys --exclude=dev --exclude=opt --exclude=.init --exclude=etc/hosts --exclude=etc/resolv.conf --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./opt --exclude=./.init --exclude=./etc/hosts --exclude=./etc/resolv.conf && rm /tmp/regicide-arch.tar.xz"])
+        .with_exec(["pacman", "-S", "--noconfirm", "--needed", "dracut", "squashfs-tools"])
+        .with_exec([
+            "sh", "-c",
+            "set -e; mkdir -p /work; kver=$(ls /lib/modules | head -1); "
+            "cp /boot/vmlinuz-linux /work/vmlinuz; "
+            "dracut --force --no-hostonly --add 'dmsquash-live' /work/initramfs.img ${kver}",
+        ], insecure_root_capabilities=True)
+    )
+
+    # 2. Assemble the ISO tree and run grub-mkrescue.
+    grub_cfg = """set timeout=5
+set default=0
+menuentry "RegicideOS Arch (live)" {
+    linux /boot/vmlinuz root=live:CDLABEL=REGICIDEOS rd.live.image rd.live.dir=/live rd.live.squashimg=rootfs.img console=tty0 console=ttyS0,115200n8
+    initrd /boot/initramfs.img
+}
+menuentry "RegicideOS Arch (live, verbose)" {
+    linux /boot/vmlinuz root=live:CDLABEL=REGICIDEOS rd.live.image rd.live.dir=/live rd.live.squashimg=rootfs.img console=tty0 console=ttyS0,115200n8 rd.debug
+    initrd /boot/initramfs.img
+}
+"""
+    iso_builder = (
+        client.container()
+        .from_("alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b")
+        .with_exec(["apk", "add", "xorriso", "grub-efi", "grub-bios", "mtools"])
+        .with_exec(["mkdir", "-p", "/iso/boot/grub", "/iso/live"])
+        .with_file("/iso/boot/vmlinuz", initrd_builder.file("/work/vmlinuz"))
+        .with_file("/iso/boot/initramfs.img", initrd_builder.file("/work/initramfs.img"))
+        .with_file("/iso/live/rootfs.img", squashfs)
+        .with_new_file("/iso/boot/grub/grub.cfg", grub_cfg)
+        # The squashfs exceeds ISO9660's 4GiB file limit; force iso-level 3
+        # (multi-extent). -iso-level is only valid in mkisofs-emulation mode,
+        # so the wrapper injects it only after "-as mkisofs" (plain
+        # "xorriso -version" must keep working for grub-mkrescue's probe).
+        .with_new_file("/usr/local/bin/xorriso", '#!/bin/sh\nif [ "$1" = "-as" ] && [ "$2" = "mkisofs" ]; then\n  shift 2\n  exec /usr/bin/xorriso -as mkisofs -iso-level 3 "$@"\nfi\nexec /usr/bin/xorriso "$@"\n')
+        .with_exec(["chmod", "+x", "/usr/local/bin/xorriso"])
+        .with_exec([
+            "grub-mkrescue",
+            "-V", "REGICIDEOS",
+            "-o", "/regicide-arch-live.iso", "/iso",
+        ])
+    )
+
+    return iso_builder.file("/regicide-arch-live.iso")
+
+
 async def build_qcow2_locally(
     tarball_path: Path,
     output_path: Path,
@@ -203,6 +268,11 @@ async def main() -> None:
         help="Install all Flatpak apps during image build instead of on first boot",
     )
     parser.add_argument(
+        "--iso",
+        action="store_true",
+        help="Also build a bootable live ISO (GRUB + dracut dmsquash-live) from the artifacts",
+    )
+    parser.add_argument(
         "--from-tarball",
         type=Path,
         default=None,
@@ -258,15 +328,25 @@ async def main() -> None:
         squashfs_path = out_dir / "regicide-arch.img"
         if squashfs_input is not None:
             print(f"Using existing SquashFS image: {squashfs_input}")
-            subprocess.run(
-                ["cp", "-f", str(squashfs_input), str(squashfs_path)],
-                check=True,
-            )
+            if squashfs_input.resolve() != squashfs_path.resolve():
+                subprocess.run(
+                    ["cp", "-f", str(squashfs_input), str(squashfs_path)],
+                    check=True,
+                )
+            else:
+                print("SquashFS input path matches output path; reusing in place.")
         else:
             print("Creating SquashFS image...")
             iso_image = await build_iso(client, tarball)
             await iso_image.export(str(squashfs_path))
         print(f"Output: {squashfs_path}")
+
+        if args.iso:
+            print("Building bootable live ISO (--iso)...")
+            squashfs_for_iso = iso_image if squashfs_input is None else client.host().file(str(squashfs_path))
+            live_iso = await build_live_iso(client, tarball, squashfs_for_iso)
+            await live_iso.export(str(out_dir / "regicide-arch.iso"))
+            print(f"Output: {out_dir / 'regicide-arch.iso'}")
 
         if args.qcow2 or args.encrypt:
             await build_qcow2_locally(

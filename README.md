@@ -22,6 +22,8 @@
 
 **RegicideOSArch** is an Arch Linux-based experimental variant of [RegicideOS](https://github.com/awdemos/RegicideOS). It shares the same design goals — immutable Btrfs root, COSMIC desktop, container-first tooling, and AI-native system integration — but uses Arch Linux and `pacman` instead of Gentoo/Portage. The primary reason is that Arch provides official COSMIC packages in the `extra` repository and a clean `pacman`-based install model, making the build pipeline simpler and faster inside nested containers.
 
+> **Default install size**: the current image ships **536 packages** (binary, no compiler toolchain) — the Gentoo variant ships **905** (source-built, full toolchain included).
+
 **This is a side project.** The main RegicideOS distribution remains the Gentoo-based effort in the [RegicideOS](https://github.com/awdemos/RegicideOS) repository.
 
 ---
