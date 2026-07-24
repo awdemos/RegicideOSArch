@@ -111,14 +111,18 @@ elif [[ "${TARBALL}" == *.tar.gz || "${TARBALL}" == *.tgz ]]; then
 fi
 
 RAW_IMG="$(mktemp --suffix=.raw)"
+PLAIN_TAR=""
+UNTARRED_DIR=""
+SEED_TARBALL=""
+SEED_SCRIPT=""
 
 cleanup() {
     echo "Cleaning up..."
     rm -f "${RAW_IMG}" 2>/dev/null || true
-    rm -f "${PLAIN_TAR}" 2>/dev/null || true
-    rm -rf "${UNTARRED_DIR}" 2>/dev/null || true
-    rm -f "${SEED_TARBALL}" 2>/dev/null || true
-    rm -f "${SEED_SCRIPT}" 2>/dev/null || true
+    [[ -n "${PLAIN_TAR}" ]] && rm -f "${PLAIN_TAR}" 2>/dev/null || true
+    [[ -n "${UNTARRED_DIR}" ]] && rm -rf "${UNTARRED_DIR}" 2>/dev/null || true
+    [[ -n "${SEED_TARBALL}" ]] && rm -f "${SEED_TARBALL}" 2>/dev/null || true
+    [[ -n "${SEED_SCRIPT}" ]] && rm -f "${SEED_SCRIPT}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -138,8 +142,7 @@ OVERLAY_IDX=3
 HOME_IDX=4
 
 echo "Decompressing tarball on host for efficient guestfish tar-in..."
-UNTARRED_DIR="/var/tmp/regicide-rootfs-staging"
-rm -rf "${UNTARRED_DIR}"
+UNTARRED_DIR="$(mktemp -d /var/tmp/regicide-rootfs-staging.XXXXXX)"
 mkdir -p "${UNTARRED_DIR}"
 PLAIN_TAR="/var/tmp/regicide-arch.tar"
 rm -f "${PLAIN_TAR}"
@@ -166,9 +169,12 @@ guestfish <<GFISH
   btrfs-subvolume-create /var
   btrfs-subvolume-create /usr
   btrfs-subvolume-create /home
-  mkdir-p /etcw
-  mkdir-p /varw
-  mkdir-p /usrw
+  mkdir-p /etc/upper
+  mkdir-p /etc/work
+  mkdir-p /var/upper
+  mkdir-p /var/work
+  mkdir-p /usr/upper
+  mkdir-p /usr/work
   umount /
 
   # Extract plain tarball into ROOTS (avoids xz decompression inside appliance).
@@ -270,7 +276,7 @@ with tarfile.open(src_path, "r") as src, tarfile.open(out_path, "w") as out:
         added.add(member.name)
         out.addfile(member)
 
-    for extra in ["etcw", "varw", "usrw"]:
+    for extra in ["etc/work", "var/work", "usr/work"]:
         info = tarfile.TarInfo(extra)
         info.type = tarfile.DIRTYPE
         info.mode = 0o755
@@ -347,7 +353,7 @@ DefaultDependencies=no
 What=overlay
 Where=/etc
 Type=overlay
-Options=lowerdir=/etc,upperdir=/overlay/etc,workdir=/overlay/etcw
+Options=lowerdir=/etc,upperdir=/overlay/etc/upper,workdir=/overlay/etc/work
 
 [Install]
 WantedBy=local-fs.target
@@ -366,7 +372,7 @@ DefaultDependencies=no
 What=overlay
 Where=/var
 Type=overlay
-Options=lowerdir=/var,upperdir=/overlay/var,workdir=/overlay/varw
+Options=lowerdir=/var,upperdir=/overlay/var/upper,workdir=/overlay/var/work
 
 [Install]
 WantedBy=local-fs.target
@@ -385,7 +391,7 @@ DefaultDependencies=no
 What=overlay
 Where=/usr
 Type=overlay
-Options=lowerdir=/usr,upperdir=/overlay/usr,workdir=/overlay/usrw
+Options=lowerdir=/usr,upperdir=/overlay/usr/upper,workdir=/overlay/usr/work
 
 [Install]
 WantedBy=local-fs.target
@@ -571,9 +577,12 @@ guestfish <<GFISH
   chmod 0755 /var/run
   mkdir-p /var/lib/systemd
   chmod 0755 /var/lib/systemd
-  mkdir-p /varw
-  mkdir-p /etcw
-  mkdir-p /usrw
+  mkdir-p /var/upper
+  mkdir-p /var/work
+  mkdir-p /etc/upper
+  mkdir-p /etc/work
+  mkdir-p /usr/upper
+  mkdir-p /usr/work
   umount /
 
   mount "/dev/sda${ROOTS_IDX}" /

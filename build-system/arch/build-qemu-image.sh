@@ -91,7 +91,7 @@ if [[ "${ENCRYPT}" == true ]]; then
     fi
 fi
 
-REQUIRED_CMDS=(qemu-img guestfish sgdisk mkfs.vfat mkfs.btrfs btrfs qemu-img tar)
+REQUIRED_CMDS=(sgdisk mkfs.vfat mkfs.btrfs btrfs tar losetup)
 if [[ "${ENCRYPT}" == true ]]; then
     REQUIRED_CMDS+=(cryptsetup)
 fi
@@ -116,12 +116,19 @@ cleanup() {
     if [[ "${ENCRYPT}" == true ]]; then
         cryptsetup close "${LUKS_NAME}" 2>/dev/null || true
     fi
+    if [[ -n "${LOOP_DEV:-}" ]]; then
+        losetup -d "${LOOP_DEV}" 2>/dev/null || true
+    fi
     rm -f "${RAW_IMG}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "Creating raw disk image (${DISK_SIZE})..."
-qemu-img create -f raw "${RAW_IMG}" "${DISK_SIZE}"
+if command -v qemu-img >/dev/null 2>&1; then
+    qemu-img create -f raw "${RAW_IMG}" "${DISK_SIZE}"
+else
+    truncate -s "${DISK_SIZE}" "${RAW_IMG}"
+fi
 
 echo "Partitioning disk image..."
 sgdisk --clear "${RAW_IMG}"
@@ -129,6 +136,14 @@ sgdisk --new=1:0:+"${EFI_SIZE}"   --typecode=1:ef00 --change-name=1:EFI     "${R
 sgdisk --new=2:0:+"${ROOTS_SIZE}"  --typecode=2:8300 --change-name=2:ROOTS   "${RAW_IMG}"
 sgdisk --new=3:0:+"${OVERLAY_SIZE}" --typecode=3:8300 --change-name=3:OVERLAY "${RAW_IMG}"
 sgdisk --new=4:0:0         --typecode=4:8300 --change-name=4:HOME    "${RAW_IMG}"
+
+# Attach the raw image to a loop device so partitions are addressable as
+# ${LOOP_DEV}pN. Requires a kernel with loop support (i.e. a real VM/host,
+# not a container).
+LOOP_DEV="$(losetup -fP --show "${RAW_IMG}")"
+# The -P scan can race udev; make sure partition nodes (${LOOP_DEV}pN) exist.
+partprobe "${LOOP_DEV}" 2>/dev/null || true
+udevadm settle --timeout=10 2>/dev/null || sleep 2
 
 # Partition indexes for guestfish (1-based)
 EFI_IDX=1
@@ -140,34 +155,51 @@ ROOTS_TARGET="/dev/sda${ROOTS_IDX}"
 
 if [[ "${ENCRYPT}" == true ]]; then
     echo "Setting up LUKS encryption on ROOTS partition..."
+    # Canonicalize the passphrase: cryptsetup --key-file consumes the file
+    # verbatim, including any trailing newline, which interactive boot
+    # prompts (GRUB cryptomount, initramfs ask-password) can never produce.
+    PASS_KEY_FILE="$(mktemp)"
     if [[ "${PASSPHRASE_FILE}" == "-" ]]; then
-        cryptsetup luksFormat --type luks2 --label "${LUKS_NAME}" --key-file - "${RAW_IMG}p${ROOTS_IDX}"
-        cryptsetup open --type luks2 --key-file - "${RAW_IMG}p${ROOTS_IDX}" "${LUKS_NAME}"
+        pass="$(cat)"
     else
-        cryptsetup luksFormat --type luks2 --label "${LUKS_NAME}" --key-file "${PASSPHRASE_FILE}" "${RAW_IMG}p${ROOTS_IDX}"
-        cryptsetup open --type luks2 --key-file "${PASSPHRASE_FILE}" "${RAW_IMG}p${ROOTS_IDX}" "${LUKS_NAME}"
+        pass="$(cat "${PASSPHRASE_FILE}")"
     fi
+    printf '%s' "${pass}" > "${PASS_KEY_FILE}"
+    # GRUB's cryptomount only supports PBKDF2 (not Argon2id) for LUKS2.
+    cryptsetup luksFormat --type luks2 --pbkdf pbkdf2 --label "${LUKS_NAME}" --key-file "${PASS_KEY_FILE}" "${LOOP_DEV}p${ROOTS_IDX}"
+    cryptsetup open --type luks2 --key-file "${PASS_KEY_FILE}" "${LOOP_DEV}p${ROOTS_IDX}" "${LUKS_NAME}"
+    rm -f "${PASS_KEY_FILE}"
     ROOTS_TARGET="/dev/mapper/${LUKS_NAME}"
-    LUKS_UUID=$(cryptsetup luksUUID "${RAW_IMG}p${ROOTS_IDX}")
+    LUKS_UUID=$(cryptsetup luksUUID "${LOOP_DEV}p${ROOTS_IDX}")
     echo "LUKS container opened: ${ROOTS_TARGET} (UUID: ${LUKS_UUID})"
 fi
 
 echo "Formatting partitions..."
-mkfs.vfat -F 32 -n EFI "${RAW_IMG}p${EFI_IDX}"
-mkfs.btrfs -L OVERLAY "${RAW_IMG}p${OVERLAY_IDX}"
-mkfs.btrfs -L HOME "${RAW_IMG}p${HOME_IDX}"
+mkfs.vfat -F 32 -n EFI "${LOOP_DEV}p${EFI_IDX}"
+mkfs.btrfs -L OVERLAY "${LOOP_DEV}p${OVERLAY_IDX}"
+mkfs.btrfs -L HOME "${LOOP_DEV}p${HOME_IDX}"
 mkfs.btrfs -L ROOTS "${ROOTS_TARGET}"
 
 echo "Creating overlay subvolumes..."
 OVERLAY_TMP="$(mktemp -d)"
-mount "${RAW_IMG}p${OVERLAY_IDX}" "${OVERLAY_TMP}"
+mount "${LOOP_DEV}p${OVERLAY_IDX}" "${OVERLAY_TMP}"
 btrfs subvolume create "${OVERLAY_TMP}/etc"
 btrfs subvolume create "${OVERLAY_TMP}/var"
 btrfs subvolume create "${OVERLAY_TMP}/usr"
 btrfs subvolume create "${OVERLAY_TMP}/home"
-mkdir -p "${OVERLAY_TMP}/etcw" "${OVERLAY_TMP}/varw" "${OVERLAY_TMP}/usrw"
+# Overlayfs workdirs must live INSIDE the matching subvolume: overlayfs
+# creates files via workdir->upperdir rename, and renames across btrfs
+# subvolume boundaries fail with EXDEV.
+mkdir -p "${OVERLAY_TMP}/etc/upper" "${OVERLAY_TMP}/etc/work" "${OVERLAY_TMP}/var/upper" "${OVERLAY_TMP}/var/work" "${OVERLAY_TMP}/usr/upper" "${OVERLAY_TMP}/usr/work"
 umount "${OVERLAY_TMP}"
 rm -rf "${OVERLAY_TMP}"
+
+echo "Creating home subvolume on HOME partition..."
+HOME_TMP="$(mktemp -d)"
+mount "${LOOP_DEV}p${HOME_IDX}" "${HOME_TMP}"
+btrfs subvolume create "${HOME_TMP}/home"
+umount "${HOME_TMP}"
+rm -rf "${HOME_TMP}"
 
 echo "Extracting tarball to ROOTS partition..."
 ROOTS_TMP="$(mktemp -d)"
@@ -184,6 +216,21 @@ tar -C "${ROOTS_TMP}" ${TAR_FLAGS} "${TARBALL}"
 
 mkdir -p "${ROOTS_TMP}/overlay" "${ROOTS_TMP}/home" "${ROOTS_TMP}/boot/efi"
 
+# Pre-create state directories so systemd services do not attempt
+# cross-device provisioning on the /var overlay (EXDEV), and pam_lastlog2
+# has a writable database directory.
+mkdir -p "${ROOTS_TMP}/var/lib/systemd" "${ROOTS_TMP}/var/lib/lastlog"
+
+echo "Seeding home subvolume from rootfs /home..."
+HOME_TMP="$(mktemp -d)"
+mount "${LOOP_DEV}p${HOME_IDX}" "${HOME_TMP}"
+cp -a "${ROOTS_TMP}/home/." "${HOME_TMP}/home/"
+# The rootfs cleanup pass chowns uid-1000 files to root; restore the user
+# home to uid 1000 so the session can chdir into it.
+chown -R 1000:1000 "${HOME_TMP}/home/regicide" 2>/dev/null || true
+umount "${HOME_TMP}"
+rm -rf "${HOME_TMP}"
+
 echo "Creating /etc/fstab..."
 ROOTS_FSTAB_SPEC="LABEL=ROOTS"
 if [[ "${ENCRYPT}" == true ]]; then
@@ -196,11 +243,38 @@ cat > "${ROOTS_TMP}/etc/fstab" << EOF
 
 ${ROOTS_FSTAB_SPEC}   /       btrfs   defaults,noatime           0 0
 LABEL=OVERLAY /overlay btrfs   defaults,noatime           0 0
-LABEL=HOME    /home   btrfs   defaults,noatime           0 0
-overlay       /etc    overlay lowerdir=/etc,upperdir=/overlay/etc,workdir=/overlay/etcw,x-systemd.requires=/overlay 0 0
-overlay       /var    overlay lowerdir=/var,upperdir=/overlay/var,workdir=/overlay/varw,x-systemd.requires=/overlay 0 0
-overlay       /usr    overlay lowerdir=/usr,upperdir=/overlay/usr,workdir=/overlay/usrw,x-systemd.requires=/overlay 0 0
+LABEL=HOME    /home   btrfs   subvol=home,defaults,noatime  0 0
 EOF
+
+# Mount /etc, /var and /usr as overlayfs via systemd .mount units, NOT fstab.
+# A /usr overlay in fstab gets mounted by the initramfs's initrd-parse-etc
+# with the initramfs's own (busybox) /usr as lowerdir, which hides the real
+# /usr after switch-root (and trips the initrd assert targets). The .mount
+# units only run in the real root, after overlay.mount.
+install -d "${ROOTS_TMP}/etc/systemd/system/local-fs.target.wants"
+for dir in etc var usr; do
+    cat > "${ROOTS_TMP}/etc/systemd/system/${dir}.mount" << EOF
+[Unit]
+Description=Overlay mount for /${dir}
+Requires=overlay.mount
+After=overlay.mount local-fs-pre.target
+Before=local-fs.target
+DefaultDependencies=no
+
+[Mount]
+What=overlay
+Where=/${dir}
+Type=overlay
+# Overlayfs workdirs must live inside the matching subvolume (renames
+# across btrfs subvolumes fail with EXDEV).
+Options=lowerdir=/${dir},upperdir=/overlay/${dir}/upper,workdir=/overlay/${dir}/work
+
+[Install]
+WantedBy=local-fs.target
+EOF
+    ln -sf "../${dir}.mount" \
+        "${ROOTS_TMP}/etc/systemd/system/local-fs.target.wants/${dir}.mount"
+done
 
 if [[ "${ENCRYPT}" == true ]]; then
     cat >> "${ROOTS_TMP}/etc/fstab" << EOF
@@ -214,13 +288,18 @@ EOF
 fi
 
 echo "Running GRUB installation and initramfs rebuild inside chroot..."
-mount "${RAW_IMG}p${EFI_IDX}" "${ROOTS_TMP}/boot/efi"
+# Bind-mount targets may not exist in the extracted rootfs (e.g. empty /dev).
+mkdir -p "${ROOTS_TMP}/dev" "${ROOTS_TMP}/proc" "${ROOTS_TMP}/sys" \
+    "${ROOTS_TMP}/run" "${ROOTS_TMP}/boot/efi"
+mount "${LOOP_DEV}p${EFI_IDX}" "${ROOTS_TMP}/boot/efi"
 mount --bind /dev "${ROOTS_TMP}/dev"
 mount --bind /proc "${ROOTS_TMP}/proc"
 mount --bind /sys "${ROOTS_TMP}/sys"
 mount --bind /run "${ROOTS_TMP}/run"
 
-chroot "${ROOTS_TMP}" /bin/bash -c '
+# Unset TMPDIR so mkinitcpio inside the chroot does not try to use the
+# host-side temporary directory (which does not exist in the chroot).
+env -u TMPDIR chroot "${ROOTS_TMP}" /bin/bash -c '
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     if [[ ! -f /etc/default/grub ]]; then
@@ -238,11 +317,12 @@ GRUBDEFAULT
     mkinitcpio -P
 
     grub-install \
-        --modules="cryptodisk luks gcry_rijndael gcry_sha256 gcry_sha1 aesni part_gpt lvm" \
+        --modules="cryptodisk luks luks2 gcry_rijndael gcry_sha256 gcry_sha1 argon2 part_gpt lvm" \
         --force \
         --target="x86_64-efi" \
         --efi-directory="/boot/efi" \
         --boot-directory="/boot/efi" \
+        --removable \
         --recheck \
         --no-nvram
 '
@@ -273,7 +353,10 @@ fi
 
 ROOTS_GRUB="root=LABEL=ROOTS"
 if [[ "${ENCRYPT}" == true ]]; then
-    ROOTS_GRUB="rd.luks.uuid=${LUKS_UUID} root=/dev/mapper/${LUKS_NAME}"
+    # rd.luks.name maps the container under a stable name without relying on
+    # /etc/crypttab being embedded in the initramfs (mkinitcpio's sd-encrypt
+    # hook does not include it, which would leave root= unresolvable).
+    ROOTS_GRUB="rd.luks.name=${LUKS_UUID}=${LUKS_NAME} root=/dev/mapper/${LUKS_NAME}"
 fi
 
 cat > "${ROOTS_TMP}/boot/efi/grub/grub.cfg" << GRUBEOF
@@ -282,6 +365,17 @@ set timeout=5
 set color_normal=light-gray/black
 set color_highlight=green/black
 
+GRUBEOF
+
+if [[ "${ENCRYPT}" == true ]]; then
+    # The ROOTS label lives inside the LUKS container; unlock it first so
+    # the search below can find the btrfs filesystem (as crypto0).
+    cat >> "${ROOTS_TMP}/boot/efi/grub/grub.cfg" << GRUBEOF
+cryptomount -u ${LUKS_UUID//-/}
+GRUBEOF
+fi
+
+cat >> "${ROOTS_TMP}/boot/efi/grub/grub.cfg" << GRUBEOF
 search --no-floppy --label --set=roots ROOTS
 
 menuentry "RegicideOSArch" {
@@ -306,7 +400,7 @@ ln -sf "${ROOTS_TMP}/boot/efi/grub/grub.cfg" "${ROOTS_TMP}/boot/efi/EFI/fedora/g
 mkdir -p "${ROOTS_TMP}/etc/default"
 GRUB_CMDLINE=""
 if [[ "${ENCRYPT}" == true ]]; then
-    GRUB_CMDLINE="rd.luks.uuid=${LUKS_UUID} root=/dev/mapper/${LUKS_NAME}"
+    GRUB_CMDLINE="rd.luks.name=${LUKS_UUID}=${LUKS_NAME} root=/dev/mapper/${LUKS_NAME}"
 fi
 
 cat > "${ROOTS_TMP}/etc/default/grub" << GRUBDEFAULT
@@ -316,7 +410,7 @@ GRUB_DISTRIBUTOR="RegicideOSArch"
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
 GRUB_CMDLINE_LINUX="${GRUB_CMDLINE}"
 GRUB_ENABLE_CRYPTODISK=y
-GRUB_PRELOAD_MODULES="cryptodisk luks gcry_rijndael gcry_sha256 gcry_sha1 aesni part_gpt lvm"
+GRUB_PRELOAD_MODULES="cryptodisk luks luks2 gcry_rijndael gcry_sha256 gcry_sha1 argon2 part_gpt lvm"
 GRUBDEFAULT
 
 echo "Unmounting chroot filesystems..."
@@ -335,7 +429,15 @@ fi
 rm -rf "${ROOTS_TMP}"
 
 echo "Converting raw image to QCOW2..."
-qemu-img convert -f raw -O qcow2 "${RAW_IMG}" "${OUTPUT}"
+if command -v qemu-img >/dev/null 2>&1; then
+    qemu-img convert -f raw -O qcow2 "${RAW_IMG}" "${OUTPUT}"
+else
+    # No qemu-img available (e.g. inside a minimal builder VM): keep the raw
+    # image; convert on the host afterwards.
+    echo "qemu-img not found; leaving raw image at ${OUTPUT}"
+    mv "${RAW_IMG}" "${OUTPUT}"
+    RAW_IMG=""
+fi
 
 rm -f "${RAW_IMG}"
 
