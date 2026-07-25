@@ -153,12 +153,24 @@ HOME_IDX=4
 
 ROOTS_TARGET="/dev/sda${ROOTS_IDX}"
 
+_secure_wipe_file() {
+    local path="${1:-}"
+    [[ -z "${path}" ]] && return 0
+    local size
+    size="$(stat -c %s "${path}" 2>/dev/null || echo 0)"
+    if [[ "${size}" -gt 0 ]]; then
+        dd if=/dev/zero of="${path}" bs=1 count="${size}" status=none 2>/dev/null || true
+        sync "${path}" 2>/dev/null || true
+    fi
+    rm -f "${path}" 2>/dev/null || true
+}
+
 if [[ "${ENCRYPT}" == true ]]; then
     echo "Setting up LUKS encryption on ROOTS partition..."
-    # Canonicalize the passphrase: cryptsetup --key-file consumes the file
-    # verbatim, including any trailing newline, which interactive boot
-    # prompts (GRUB cryptomount, initramfs ask-password) can never produce.
-    PASS_KEY_FILE="$(mktemp)"
+    # Canonicalize the passphrase in /dev/shm with 0600 permissions.  Strip any
+    # trailing newline because cryptsetup --key-file consumes the file verbatim.
+    PASS_KEY_FILE="$(mktemp -p /dev/shm regicide-luks-XXXXXX)"
+    chmod 0600 "${PASS_KEY_FILE}"
     if [[ "${PASSPHRASE_FILE}" == "-" ]]; then
         pass="$(cat)"
     else
@@ -168,7 +180,7 @@ if [[ "${ENCRYPT}" == true ]]; then
     # GRUB's cryptomount only supports PBKDF2 (not Argon2id) for LUKS2.
     cryptsetup luksFormat --type luks2 --pbkdf pbkdf2 --label "${LUKS_NAME}" --key-file "${PASS_KEY_FILE}" "${LOOP_DEV}p${ROOTS_IDX}"
     cryptsetup open --type luks2 --key-file "${PASS_KEY_FILE}" "${LOOP_DEV}p${ROOTS_IDX}" "${LUKS_NAME}"
-    rm -f "${PASS_KEY_FILE}"
+    _secure_wipe_file "${PASS_KEY_FILE}"
     ROOTS_TARGET="/dev/mapper/${LUKS_NAME}"
     LUKS_UUID=$(cryptsetup luksUUID "${LOOP_DEV}p${ROOTS_IDX}")
     echo "LUKS container opened: ${ROOTS_TARGET} (UUID: ${LUKS_UUID})"
