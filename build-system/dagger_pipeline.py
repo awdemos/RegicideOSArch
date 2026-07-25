@@ -26,21 +26,92 @@ import dagger
 import dagger_common
 
 
-def _prompt_luks_passphrase() -> str:
-    """Return the LUKS passphrase from the environment or prompt twice."""
+# Small built-in wordlists for memorable adjective-noun passphrases.
+_ADJECTIVES = (
+    "able", "apt", "avid", "bare", "bold", "brisk", "calm", "cool", "curt",
+    "deft", "dire", "dual", "even", "fair", "fast", "firm", "fond", "free",
+    "full", "gale", "glib", "good", "grim", "hardy", "huge", "hush", "iron",
+    "jade", "jolly", "keen", "kind", "lax", "lean", "lush", "mere", "mild",
+    "mute", "neat", "nice", "nimble", "open", "pale", "plucky", "prime",
+    "quiet", "quick", "rapid", "rare", "raw", "real", "rich", "rough", "rugged",
+    "safe", "sage", "sharp", "sleek", "slow", "smooth", "soft", "solid",
+    "sound", "spry", "stark", "stout", "swift", "tame", "tart", "taut", "tidy",
+    "trim", "true", "vast", "warm", "wild", "wiry", "wise", "witty", "zany",
+)
+_NOUNS = (
+    "almond", "anchor", "arrow", "bison", "bronco", "canoe", "canyon",
+    "cedar", "chisel", "cobalt", "comet", "copper", "crane", "crystal",
+    "delta", "eagle", "elm", "falcon", "fjord", "flint", "fox", "gale",
+    "gecko", "glacier", "grape", "harbor", "hawk", "heron", "ibis",
+    "iron", "jackal", "jade", "koala", "lark", "lemon", "lotus", "lynx",
+    "maple", "mesa", "mint", "moose", "newt", "oasis", "onion", "opal",
+    "orca", "panda", "pearl", "pilot", "plum", "quartz", "rabbit", "raven",
+    "reef", "ridge", "river", "robin", "rock", "sage", "salmon", "scorpion",
+    "shark", "shore", "sparrow", "stone", "summit", "swan", "talon", "thorn",
+    "tiger", "topaz", "valley", "violet", "wolf", "wren", "zest", "zinc",
+)
+
+
+def _generate_memorable_passphrase() -> str:
+    """Return a memorable adjective-adjective-noun passphrase."""
+    import secrets
+    return "-".join([
+        secrets.choice(_ADJECTIVES),
+        secrets.choice(_ADJECTIVES),
+        secrets.choice(_NOUNS),
+    ])
+
+
+def _generate_otp_style_passphrase(length: int = 32) -> str:
+    """Return a long numeric string reminiscent of an OTP token."""
+    import secrets
+    return "".join(secrets.choice("0123456789") for _ in range(length))
+
+
+def _generate_random_passphrase() -> str:
+    """Return a high-entropy random passphrase."""
+    import secrets
+    return secrets.token_urlsafe(24)
+
+
+def _get_luks_passphrase(
+    *,
+    passphrase_file: Path | None = None,
+    memorable: bool = False,
+    otp_style: bool = False,
+) -> str:
+    """Return the LUKS passphrase from the most secure available source.
+
+    Priority:
+      1. Explicit --luks-passphrase-file contents (CI secret mode).
+      2. REGICIDE_LUKS_PASSPHRASE environment variable (CI secret mode).
+      3. Auto-generated passphrase printed once to stderr.
+
+    The passphrase is printed exactly once on stderr so CI logs can capture it
+    for the operator, but it is not emitted inside any Dagger container exec.
+    """
+    if passphrase_file is not None:
+        raw = passphrase_file.read_text(encoding="utf-8")
+        return raw.rstrip("\n")
+
     env_pass = os.environ.get("REGICIDE_LUKS_PASSPHRASE")
     if env_pass:
         return env_pass
-    while True:
-        first = getpass.getpass("Enter LUKS passphrase for encrypted image: ")
-        if not first:
-            print("Passphrase cannot be empty.")
-            continue
-        second = getpass.getpass("Confirm LUKS passphrase: ")
-        if first != second:
-            print("Passphrases do not match. Try again.")
-            continue
-        return first
+
+    if memorable:
+        passphrase = _generate_memorable_passphrase()
+    elif otp_style:
+        passphrase = _generate_otp_style_passphrase()
+    else:
+        passphrase = _generate_random_passphrase()
+
+    print(
+        "\n!!! ENCRYPTED IMAGE PASSPHRASE (copy before continuing) !!!\n"
+        f"{passphrase}\n"
+        "!!! This is the only time this passphrase is displayed. !!!\n",
+        file=sys.stderr,
+    )
+    return passphrase
 
 
 async def build_arch_cosmic(
@@ -176,6 +247,9 @@ async def build_qcow2_locally(
     output_path: Path,
     disk_size: str,
     encrypt: bool,
+    passphrase_file: Path | None = None,
+    memorable: bool = False,
+    otp_style: bool = False,
 ) -> None:
     """Build a bootable QCOW2 image from a stage4 tarball on the host.
 
@@ -196,21 +270,31 @@ async def build_qcow2_locally(
         disk_size,
     ]
 
-    passphrase_file: Path | None = None
     if encrypt:
-        passphrase = _prompt_luks_passphrase()
-        fd, passphrase_tmp = tempfile.mkstemp(prefix="regicide-luks-", text=True)
+        passphrase = _get_luks_passphrase(
+            passphrase_file=passphrase_file,
+            memorable=args.memorable_passphrase,
+            otp_style=args.otp_style_passphrase,
+        )
+        # Stage the passphrase in /dev/shm with 0600 permissions and no trailing
+        # newline so cryptsetup reads the exact human passphrase.  Do not use
+        # REGICIDE_LUKS_PASSPHRASE in child processes.
+        fd, passphrase_tmp = tempfile.mkstemp(
+            prefix="regicide-luks-", dir="/dev/shm", text=True
+        )
         passphrase_file = Path(passphrase_tmp)
         with os.fdopen(fd, "w") as f:
-            f.write(passphrase + "\n")
-        passphrase_file.chmod(0o600)
+            f.write(passphrase)
+        os.fchmod(fd, 0o600)
         cmd[1:1] = ["--encrypt", "--passphrase-file", str(passphrase_file)]
         print(f"Building encrypted QCOW2 image: {output_path}")
     else:
         print(f"Building unencrypted QCOW2 image: {output_path}")
 
     try:
-        subprocess.run(cmd, check=True)
+        env = os.environ.copy()
+        env.pop("REGICIDE_LUKS_PASSPHRASE", None)
+        subprocess.run(cmd, check=True, env=env)
     finally:
         if passphrase_file is not None:
             try:
@@ -233,7 +317,23 @@ async def main() -> None:
     parser.add_argument(
         "--encrypt",
         action="store_true",
-        help="Also build an encrypted QCOW2 disk image and prompt for a LUKS passphrase",
+        help="Also build an encrypted QCOW2 disk image; auto-generate a passphrase if no secret source is provided",
+    )
+    parser.add_argument(
+        "--luks-passphrase-file",
+        type=Path,
+        default=None,
+        help="Path to a file containing the LUKS passphrase (CI secret mode; no terminal prompt)",
+    )
+    parser.add_argument(
+        "--memorable-passphrase",
+        action="store_true",
+        help="Generate a human-readable adjective-adjective-noun passphrase instead of a random token",
+    )
+    parser.add_argument(
+        "--otp-style-passphrase",
+        action="store_true",
+        help="Generate a long numeric passphrase reminiscent of an OTP token",
     )
     parser.add_argument(
         "--qcow2",
@@ -283,6 +383,11 @@ async def main() -> None:
         type=Path,
         default=None,
         help="Reuse an existing SquashFS image instead of rebuilding it in Dagger",
+    )
+    parser.add_argument(
+        "--run-vm-test",
+        action="store_true",
+        help="Run the post-install VM smoke test after building the QCOW2 image",
     )
     args = parser.parse_args()
 
@@ -349,12 +454,32 @@ async def main() -> None:
             print(f"Output: {out_dir / 'regicide-arch.iso'}")
 
         if args.qcow2 or args.encrypt:
+            qcow2_output = Path(args.qcow2_output).resolve()
+            if args.encrypt and not args.qcow2_output.endswith("-enc.qcow2"):
+                # Use a distinct encrypted output path so VM tests and artifacts
+                # do not collide with unencrypted builds.
+                qcow2_output = qcow2_output.with_suffix("")
+                qcow2_output = Path(str(qcow2_output) + "-enc.qcow2")
             await build_qcow2_locally(
                 tarball_path=tarball_path,
-                output_path=Path(args.qcow2_output).resolve(),
+                output_path=qcow2_output,
                 disk_size=args.qcow2_size,
                 encrypt=args.encrypt,
+                passphrase_file=args.luks_passphrase_file,
+                memorable=args.memorable_passphrase,
+                otp_style=args.otp_style_passphrase,
             )
+            if args.run_vm_test:
+                print("Running stage7 artifact verification...")
+                subprocess.run(
+                    ["./build-system/arch/stage7-verify.sh"],
+                    check=True,
+                )
+                print("Running stage8 post-install VM test...")
+                subprocess.run(
+                    ["./build-system/arch/stage8-vm-test.sh", str(qcow2_output)],
+                    check=True,
+                )
 
 
 if __name__ == "__main__":

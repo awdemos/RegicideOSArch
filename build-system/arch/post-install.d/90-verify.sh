@@ -69,6 +69,24 @@ if [[ "${REGICIDE_ENABLE_NVIDIA}" == "1" ]]; then
     fi
 fi
 
+# 8. LUKS/BTRFS runtime tooling present.
+for bin in cryptsetup btrfs; do
+    if command -v "${bin}" >/dev/null 2>&1; then
+        pass "${bin} binary present"
+    else
+        error "${bin} binary missing"
+    fi
+done
+
+# 9. mkinitcpio LUKS hooks present if cryptsetup is installed.
+if pacman -Q cryptsetup >/dev/null 2>&1; then
+    if grep -qE '\b(sd-encrypt|encrypt)\b' /etc/mkinitcpio.conf; then
+        pass "mkinitcpio LUKS hooks configured"
+    else
+        error "mkinitcpio LUKS hooks missing"
+    fi
+fi
+
 if [[ ${ERRORS} -gt 0 ]]; then
     echo "VERIFY FAILED: ${ERRORS} error(s)" >&2
     exit 1
