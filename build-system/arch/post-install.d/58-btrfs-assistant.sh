@@ -14,6 +14,9 @@ su - "${BUILD_USER}" -c '
     set -euo pipefail
     git clone --depth 1 https://aur.archlinux.org/btrfs-assistant.git /tmp/btrfs-assistant
     cd /tmp/btrfs-assistant
+    # Suppress Qt 6.11 deprecation warnings treated as errors by upstream build flags.
+    export CXXFLAGS="${CXXFLAGS:-} -Wno-error=deprecated-declarations"
+    sed -i "s|cmake |cmake -DCMAKE_CXX_FLAGS=\\\"${CXXFLAGS}\\\" |g" PKGBUILD
     makepkg -sri --noconfirm
 '
 

@@ -9,6 +9,10 @@ error() {
     ERRORS=$((ERRORS + 1))
 }
 
+pass() {
+    echo "VERIFY OK: $1"
+}
+
 # 1. Greetd auto-login configuration.
 if [[ ! -f /etc/greetd/cosmic-greeter.toml ]]; then
     error "/etc/greetd/cosmic-greeter.toml missing"

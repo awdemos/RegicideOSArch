@@ -13,6 +13,8 @@ from pathlib import Path
 
 import dagger
 
+import dagger_common
+
 
 def _cpu_count() -> int:
     """Return the number of host CPUs to expose to the build container."""
@@ -54,15 +56,12 @@ async def build_arch_cosmic_arm64(
     jobs = _cpu_count()
     rootfs_dir = "/var/tmp/regicide-root"
 
-    pacman_cache = client.cache_volume("regicide-arch-arm64-pacman")
-
     # Pinned Arch Linux ARM base image. The menci/archlinuxarm image is a
     # public AArch64 rootfs with working pacman/keyring configuration.
     base = (
         client.container()
         .from_("menci/archlinuxarm@sha256:4ce4f12cae8461f6293b7a3bd66da75f65c0a2786337aef847413cb707c3de48")
         .with_env_variable("MAKEFLAGS", f"-j{jobs}")
-        .with_mounted_cache("/var/cache/pacman/pkg", pacman_cache)
     )
 
     # Arch Linux ARM's pacman uses sandboxing that fails inside Dagger's
@@ -94,9 +93,17 @@ async def build_arch_cosmic_arm64(
 
     flatpaks_flag = "1" if defer_flatpaks else "0"
 
+    # Seed the ARM64 pacman cache, install the VM packages, and save the
+    # cache.  Save again after post-install so additional packages are cached.
     vm_packages = _load_package_list("vm-arm64")
+    with_keyring = dagger_common.seed_pacman_cache(
+        with_keyring, client, cache_name="regicide-arch-arm64-pacman"
+    )
     with_rootfs = with_keyring.with_exec(
         ["pacman", "-S", "--needed", "--noconfirm", "--disable-download-timeout"] + vm_packages
+    )
+    with_rootfs = dagger_common.save_pacman_cache(
+        with_rootfs, client, cache_name="regicide-arch-arm64-pacman"
     )
 
     with_post = (
@@ -111,6 +118,9 @@ async def build_arch_cosmic_arm64(
                 "SRC_DIR=/src bash /tmp/regicide-arch-build/post-install.sh",
             ]
         )
+    )
+    with_post = dagger_common.save_pacman_cache(
+        with_post, client, cache_name="regicide-arch-arm64-pacman"
     )
 
     return with_post.with_exec(
@@ -132,13 +142,18 @@ async def build_iso(
 ) -> dagger.File:
     """Create a SquashFS image from a stage4 tarball for live ISO use."""
 
-    alpine_cache = client.cache_volume("regicide-arch-alpine")
-
     builder = (
         client.container()
         .from_("alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b")
-        .with_mounted_cache("/var/cache/apk", alpine_cache)
-        .with_exec(["apk", "add", "squashfs-tools", "tar", "xz"])
+    )
+
+    # Seed/save the apk cache so the package install is content-cacheable.
+    builder = dagger_common.seed_apk_cache(builder, client)
+    builder = builder.with_exec(["apk", "add", "squashfs-tools", "tar", "xz"])
+    builder = dagger_common.save_apk_cache(builder, client)
+
+    builder = (
+        builder
         .with_file("/tmp/regicide-arch.tar.xz", tarball)
         .with_exec(["mkdir", "-p", "/tmp/rootfs"])
         .with_exec([
