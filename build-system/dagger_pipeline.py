@@ -168,7 +168,7 @@ async def build_iso(
         .from_("alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b")
     )
 
-    # Seed/save the apk cache so the package install is content-cacheable.
+    # Seed/save the apk cache so the package install is cacheable.
     builder = dagger_common.seed_apk_cache(builder, client)
     builder = builder.with_exec(["apk", "add", "squashfs-tools", "tar", "xz"])
     builder = dagger_common.save_apk_cache(builder, client)
@@ -259,6 +259,34 @@ menuentry "RegicideOS Arch (live, verbose)" {
     return iso_builder.file("/regicide-arch-live.iso")
 
 
+async def _dagger_keepalive(client: dagger.Client, interval: float = 30.0) -> None:
+    """Send a tiny no-op query every `interval` seconds to keep the Dagger
+    session alive while a long-running host subprocess runs."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await client.container().from_("alpine").with_exec(
+                ["echo", "dagger-keepalive"]
+            ).stdout()
+        except asyncio.CancelledError:
+            return
+
+
+def _stop_dagger_engine() -> None:
+    """Stop the Dagger engine container to free memory before a long-running
+    host-side step (the encrypted image builder boots its own KVM VM)."""
+    engine = "dagger-engine-v0.21.7"
+    try:
+        subprocess.run(
+            ["docker", "stop", "-t", "30", engine],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
 async def build_qcow2_locally(
     tarball_path: Path,
     output_path: Path,
@@ -267,24 +295,26 @@ async def build_qcow2_locally(
     passphrase_file: Path | None = None,
     memorable: bool = False,
     otp_style: bool = False,
+    squashfs_path: Path | None = None,
+    client: dagger.Client | None = None,
 ) -> None:
     """Build a bootable QCOW2 image from a stage4 tarball on the host.
 
-    The encrypted image uses build-qemu-image.sh (loop-device + GRUB). The
-    plain image uses build-qemu-image-guestfish.sh, which requires no host loop
-    devices or passwordless sudo beyond the sudo it invokes itself.
+    The encrypted image uses build-vm-image.sh, which boots a KVM appliance to
+    avoid host loop devices. The plain image uses build-qemu-image-guestfish.sh,
+    which requires no host loop devices or passwordless sudo beyond the sudo it
+    invokes itself. Default disk size is 30G to fit the 8+GiB uncompressed
+    COSMIC rootfs plus overlay and home partitions.
     """
-    script_name = "build-qemu-image.sh" if encrypt else "build-qemu-image-guestfish.sh"
-    script = Path(__file__).parent / "arch" / script_name
+    if encrypt:
+        script = Path(__file__).parent / "arch" / "build-vm-image.sh"
+    else:
+        script = Path(__file__).parent / "arch" / "build-qemu-image-guestfish.sh"
     if not script.exists():
         raise FileNotFoundError(f"Image builder script not found: {script}")
 
     cmd: list[str] = [
-        "sudo",
         str(script),
-        str(tarball_path),
-        str(output_path),
-        disk_size,
     ]
 
     if encrypt:
@@ -303,15 +333,40 @@ async def build_qcow2_locally(
         passphrase_file = Path(passphrase_tmp)
         with os.fdopen(fd, "w") as f:
             f.write(passphrase)
-        cmd[2:2] = ["--encrypt", "--passphrase-file", str(passphrase_file)]
+        cmd += [
+            "--encrypt",
+            "--passphrase-file",
+            str(passphrase_file),
+        ]
+        if squashfs_path is not None:
+            cmd += ["--squashfs", str(squashfs_path)]
         print(f"Building encrypted QCOW2 image: {output_path}")
     else:
         print(f"Building unencrypted QCOW2 image: {output_path}")
 
+    cmd += [str(tarball_path), str(output_path), disk_size]
+
     try:
-        env = os.environ.copy()
-        env.pop("REGICIDE_LUKS_PASSPHRASE", None)
-        subprocess.run(cmd, check=True, env=env)
+        # Run the host builder while optionally keeping the Dagger session alive
+        # with periodic no-op queries. Long-running subprocesses that do not
+        # touch the Dagger API can otherwise look idle and cause the engine to
+        # close the session (and SIGKILL the child).
+        if client is not None:
+            ping = asyncio.create_task(_dagger_keepalive(client))
+        else:
+            ping = None
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        try:
+            await proc.wait()
+        finally:
+            if ping is not None:
+                ping.cancel()
+                try:
+                    await ping
+                except asyncio.CancelledError:
+                    pass
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
     finally:
         if passphrase_file is not None:
             try:
@@ -359,8 +414,8 @@ async def main() -> None:
     )
     parser.add_argument(
         "--qcow2-size",
-        default="20G",
-        help="Disk size for the optional QCOW2 image (default: 20G)",
+        default="30G",
+        help="Disk size for the optional QCOW2 image (default: 30G)",
     )
     parser.add_argument(
         "--qcow2-output",
@@ -424,6 +479,10 @@ async def main() -> None:
             print(f"Error: --from-squashfs file not found: {squashfs_input}", file=sys.stderr)
             sys.exit(1)
 
+    project_root = Path(__file__).resolve().parent.parent
+    out_dir = project_root / "build-system" / "arch" / "output"
+    squashfs_path = out_dir / "regicide-arch.img"
+
     config = dagger.Config(log_output=sys.stdout)
     async with dagger.Connection(config) as client:
         if tarball_path is None:
@@ -438,16 +497,12 @@ async def main() -> None:
             print(f"Using existing stage4 tarball: {tarball_path}")
             tarball = client.host().file(str(tarball_path))
 
-        project_root = Path(__file__).resolve().parent.parent
-        out_dir = project_root / "build-system" / "arch" / "output"
-
         if tarball_path is None:
             print("Exporting stage4 tarball...")
             tarball_path = out_dir / "regicide-arch.tar.xz"
             await tarball.export(str(tarball_path))
             print(f"Output: {tarball_path}")
 
-        squashfs_path = out_dir / "regicide-arch.img"
         if squashfs_input is not None:
             print(f"Using existing SquashFS image: {squashfs_input}")
             if squashfs_input.resolve() != squashfs_path.resolve():
@@ -465,38 +520,45 @@ async def main() -> None:
 
         if args.iso:
             print("Building bootable live ISO (--iso)...")
-            squashfs_for_iso = iso_image if squashfs_input is None else client.host().file(str(squashfs_path))
+            squashfs_for_iso = client.host().file(str(squashfs_path))
             live_iso = await build_live_iso(client, tarball, squashfs_for_iso)
             await live_iso.export(str(out_dir / "regicide-arch.iso"))
             print(f"Output: {out_dir / 'regicide-arch.iso'}")
 
-        if args.qcow2 or args.encrypt:
-            qcow2_output = Path(args.qcow2_output).resolve()
-            if args.encrypt and not args.qcow2_output.endswith("-enc.qcow2"):
-                # Use a distinct encrypted output path so VM tests and artifacts
-                # do not collide with unencrypted builds.
-                qcow2_output = qcow2_output.with_suffix("")
-                qcow2_output = Path(str(qcow2_output) + "-enc.qcow2")
-            await build_qcow2_locally(
-                tarball_path=tarball_path,
-                output_path=qcow2_output,
-                disk_size=args.qcow2_size,
-                encrypt=args.encrypt,
-                passphrase_file=args.luks_passphrase_file,
-                memorable=args.memorable_passphrase,
-                otp_style=args.otp_style_passphrase,
+    # Exit the Dagger session before the long host-side builder step. The
+    # encrypted image builder boots its own KVM appliance, which needs a lot of
+    # memory; stopping the Dagger engine frees resources for that VM.
+    if args.qcow2 or args.encrypt:
+        print("Shutting down Dagger engine to free memory for the host image builder...")
+        _stop_dagger_engine()
+        qcow2_output = Path(args.qcow2_output).resolve()
+        if args.encrypt and not args.qcow2_output.endswith("-enc.qcow2"):
+            # Use a distinct encrypted output path so VM tests and artifacts
+            # do not collide with unencrypted builds.
+            qcow2_output = qcow2_output.with_suffix("")
+            qcow2_output = Path(str(qcow2_output) + "-enc.qcow2")
+        await build_qcow2_locally(
+            tarball_path=tarball_path,
+            output_path=qcow2_output,
+            disk_size=args.qcow2_size,
+            encrypt=args.encrypt,
+            passphrase_file=args.luks_passphrase_file,
+            memorable=args.memorable_passphrase,
+            otp_style=args.otp_style_passphrase,
+            squashfs_path=squashfs_path,
+            client=None,
+        )
+        if args.run_vm_test:
+            print("Running stage7 artifact verification...")
+            subprocess.run(
+                ["./build-system/arch/stage7-verify.sh"],
+                check=True,
             )
-            if args.run_vm_test:
-                print("Running stage7 artifact verification...")
-                subprocess.run(
-                    ["./build-system/arch/stage7-verify.sh"],
-                    check=True,
-                )
-                print("Running stage8 post-install VM test...")
-                subprocess.run(
-                    ["./build-system/arch/stage8-vm-test.sh", str(qcow2_output)],
-                    check=True,
-                )
+            print("Running stage8 post-install VM test...")
+            subprocess.run(
+                ["./build-system/arch/stage8-vm-test.sh", str(qcow2_output)],
+                check=True,
+            )
 
 
 if __name__ == "__main__":

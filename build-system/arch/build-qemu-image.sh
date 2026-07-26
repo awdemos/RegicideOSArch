@@ -1,20 +1,25 @@
 #!/bin/bash
-# RegicideOSArch QEMU Disk Image Builder (guestfish-based)
+# RegicideOSArch QEMU Disk Image Builder
 # Creates a bootable QCOW2 disk image from a RegicideOSArch tarball.
-# This version uses libguestfs/guestfish so it does not require host loop devices.
+# Supports both loop-device (host) and direct-block-device (in-VM) modes.
 
 set -euo pipefail
+
+# Ensure tools installed under /usr/sbin are discoverable inside chroots.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:${PATH}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TARBALL=""
 OUTPUT="${SCRIPT_DIR}/output/regicide-arch.qcow2"
-DISK_SIZE="${REGICIDE_DISK_SIZE:-20G}"
+DISK_SIZE="${REGICIDE_DISK_SIZE:-30G}"
 EFI_SIZE="${REGICIDE_EFI_SIZE:-512M}"
 ROOTS_SIZE="${REGICIDE_ROOTS_SIZE:-12G}"
 OVERLAY_SIZE="${REGICIDE_OVERLAY_SIZE:-4G}"
 ENCRYPT=false
 PASSPHRASE_FILE=""
+DIRECT_DEVICE=""
+NO_CONVERT=false
 POS=0
 
 usage() {
@@ -29,10 +34,15 @@ Options:
   --encrypt              Encrypt the ROOTS partition with LUKS2
   --passphrase-file      Path to a file containing the LUKS passphrase
                          (required with --encrypt; use - for stdin)
+  --direct-device        Use an existing raw block device instead of creating a
+                         temporary raw file and loop device (e.g. /dev/vda).
+  --no-convert           Do not convert the raw image to QCOW2 at the end.
+                         Useful when a wrapper will convert the raw disk.
 
 Examples:
   $0 /path/to/regicide-arch.tar.xz
   $0 --encrypt --passphrase-file /run/luks-passphrase /path/to/regicide-arch.tar.xz ./my-image.qcow2 30G
+  $0 --direct-device /dev/vda --no-convert /path/to/regicide-arch.tar.xz /tmp/image.qcow2 20G
 EOF
     exit 1
 }
@@ -46,6 +56,14 @@ while [[ $# -gt 0 ]]; do
         --passphrase-file)
             PASSPHRASE_FILE="${2:-}"
             shift 2
+            ;;
+        --direct-device)
+            DIRECT_DEVICE="${2:-}"
+            shift 2
+            ;;
+        --no-convert)
+            NO_CONVERT=true
+            shift
             ;;
         -h|--help)
             usage
@@ -80,6 +98,27 @@ if [[ ! -f "${TARBALL}" ]]; then
     exit 1
 fi
 
+validate_block_device() {
+    local dev="${1:-}"
+    if [[ -z "${dev}" ]]; then
+        return 0
+    fi
+    if [[ "${dev}" != /dev/* ]]; then
+        echo "Error: direct device must be an absolute /dev path: ${dev}" >&2
+        exit 1
+    fi
+    if [[ "${dev}" =~ \.\.|//|\.$ ]]; then
+        echo "Error: invalid direct device path: ${dev}" >&2
+        exit 1
+    fi
+    if [[ ! -b "${dev}" ]]; then
+        echo "Error: direct device is not a block device: ${dev}" >&2
+        exit 1
+    fi
+}
+
+validate_block_device "${DIRECT_DEVICE}"
+
 if [[ "${ENCRYPT}" == true ]]; then
     if [[ -z "${PASSPHRASE_FILE}" ]]; then
         echo "Error: --passphrase-file is required when --encrypt is used."
@@ -91,9 +130,17 @@ if [[ "${ENCRYPT}" == true ]]; then
     fi
 fi
 
-REQUIRED_CMDS=(sgdisk mkfs.vfat mkfs.btrfs btrfs tar losetup)
+if [[ -n "${DIRECT_DEVICE}" ]]; then
+    REQUIRED_CMDS=(mkfs.vfat mkfs.btrfs btrfs tar)
+else
+    REQUIRED_CMDS=(mkfs.vfat mkfs.btrfs btrfs tar losetup partprobe)
+fi
 if [[ "${ENCRYPT}" == true ]]; then
     REQUIRED_CMDS+=(cryptsetup)
+fi
+if ! command -v sgdisk >/dev/null 2>&1 && ! command -v parted >/dev/null 2>&1; then
+    echo "Error: either sgdisk or parted is required for partitioning."
+    exit 1
 fi
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "${cmd}" &> /dev/null; then
@@ -107,43 +154,127 @@ OUTPUT="$(realpath -m "${OUTPUT}")"
 OUTPUT_DIR="$(dirname "${OUTPUT}")"
 mkdir -p "${OUTPUT_DIR}"
 
-RAW_IMG="$(mktemp --suffix=.raw)"
+if [[ -n "${DIRECT_DEVICE}" ]]; then
+    RAW_IMG="${DIRECT_DEVICE}"
+else
+    RAW_IMG="$(mktemp --suffix=.raw)"
+fi
 LUKS_NAME="regicide-arch"
 LUKS_UUID=""
+
+LOOP_DEV=""
 
 cleanup() {
     echo "Cleaning up..."
     if [[ "${ENCRYPT}" == true ]]; then
         cryptsetup close "${LUKS_NAME}" 2>/dev/null || true
     fi
-    if [[ -n "${LOOP_DEV:-}" ]]; then
+    if [[ -n "${LOOP_DEV}" ]]; then
         losetup -d "${LOOP_DEV}" 2>/dev/null || true
     fi
-    rm -f "${RAW_IMG}" 2>/dev/null || true
+    if [[ -z "${DIRECT_DEVICE}" ]]; then
+        rm -f "${RAW_IMG}" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
-echo "Creating raw disk image (${DISK_SIZE})..."
-if command -v qemu-img >/dev/null 2>&1; then
-    qemu-img create -f raw "${RAW_IMG}" "${DISK_SIZE}"
-else
-    truncate -s "${DISK_SIZE}" "${RAW_IMG}"
+if [[ -z "${DIRECT_DEVICE}" ]]; then
+    echo "Creating raw disk image (${DISK_SIZE})..."
+    if command -v qemu-img >/dev/null 2>&1; then
+        qemu-img create -f raw "${RAW_IMG}" "${DISK_SIZE}"
+    else
+        truncate -s "${DISK_SIZE}" "${RAW_IMG}"
+    fi
 fi
 
-echo "Partitioning disk image..."
-sgdisk --clear "${RAW_IMG}"
-sgdisk --new=1:0:+"${EFI_SIZE}"   --typecode=1:ef00 --change-name=1:EFI     "${RAW_IMG}"
-sgdisk --new=2:0:+"${ROOTS_SIZE}"  --typecode=2:8300 --change-name=2:ROOTS   "${RAW_IMG}"
-sgdisk --new=3:0:+"${OVERLAY_SIZE}" --typecode=3:8300 --change-name=3:OVERLAY "${RAW_IMG}"
-sgdisk --new=4:0:0         --typecode=4:8300 --change-name=4:HOME    "${RAW_IMG}"
+# Convert an IEC size string (512M, 12G, ...) to an integer number of MiB so
+# parted can use uniform units regardless of how the inputs were written.
+_size_to_mib() {
+    local bytes
+    bytes=$(numfmt --from=iec "$1")
+    echo "$(( bytes / 1024 / 1024 ))"
+}
 
-# Attach the raw image to a loop device so partitions are addressable as
-# ${LOOP_DEV}pN. Requires a kernel with loop support (i.e. a real VM/host,
-# not a container).
-LOOP_DEV="$(losetup -fP --show "${RAW_IMG}")"
-# The -P scan can race udev; make sure partition nodes (${LOOP_DEV}pN) exist.
-partprobe "${LOOP_DEV}" 2>/dev/null || true
-udevadm settle --timeout=10 2>/dev/null || sleep 2
+EFI_MIB=$(_size_to_mib "${EFI_SIZE}")
+ROOTS_MIB=$(_size_to_mib "${ROOTS_SIZE}")
+OVERLAY_MIB=$(_size_to_mib "${OVERLAY_SIZE}")
+DISK_MIB=$(_size_to_mib "${DISK_SIZE}")
+
+# Ensure the requested partitions fit on the target disk. If they do not,
+# scale ROOTS and OVERLAY proportionally, always leaving at least 1 GiB for HOME.
+MIN_HOME_MIB=1024
+if [[ "$(( EFI_MIB + ROOTS_MIB + OVERLAY_MIB + MIN_HOME_MIB ))" -gt "${DISK_MIB}" ]]; then
+    echo "Warning: requested partitions (${EFI_SIZE} + ${ROOTS_SIZE} + ${OVERLAY_SIZE}) do not fit on ${DISK_SIZE}; scaling down."
+    AVAILABLE_MIB=$(( DISK_MIB - EFI_MIB - MIN_HOME_MIB ))
+    ROOTS_MIB=$(( AVAILABLE_MIB / 2 ))
+    OVERLAY_MIB=$(( AVAILABLE_MIB - ROOTS_MIB ))
+fi
+
+ROOTS_END_MIB=$(( EFI_MIB + ROOTS_MIB ))
+OVERLAY_END_MIB=$(( EFI_MIB + ROOTS_MIB + OVERLAY_MIB ))
+
+echo "Partitioning disk image..."
+echo "  EFI:     ${EFI_MIB}MiB"
+echo "  ROOTS:   ${EFI_MIB}MiB - ${ROOTS_END_MIB}MiB"
+echo "  OVERLAY: ${ROOTS_END_MIB}MiB - ${OVERLAY_END_MIB}MiB"
+echo "  HOME:    ${OVERLAY_END_MIB}MiB - end"
+PARTITION_TARGET="${DIRECT_DEVICE:-${RAW_IMG}}"
+if command -v sgdisk > /dev/null 2>&1; then
+    sgdisk --clear "${PARTITION_TARGET}"
+    sgdisk --new=1:0:+"${EFI_MIB}M"     --typecode=1:ef00 --change-name=1:EFI     "${PARTITION_TARGET}"
+    sgdisk --new=2:0:+"${ROOTS_MIB}M"   --typecode=2:8300 --change-name=2:ROOTS   "${PARTITION_TARGET}"
+    sgdisk --new=3:0:+"${OVERLAY_MIB}M" --typecode=3:8300 --change-name=3:OVERLAY "${PARTITION_TARGET}"
+    sgdisk --new=4:0:0                   --typecode=4:8300 --change-name=4:HOME    "${PARTITION_TARGET}"
+else
+    parted -s "${PARTITION_TARGET}" mklabel gpt
+    parted -s "${PARTITION_TARGET}" mkpart EFI fat32 1MiB "${EFI_MIB}MiB"
+    parted -s "${PARTITION_TARGET}" mkpart ROOTS btrfs "${EFI_MIB}MiB" "${ROOTS_END_MIB}MiB"
+    parted -s "${PARTITION_TARGET}" mkpart OVERLAY btrfs "${ROOTS_END_MIB}MiB" "${OVERLAY_END_MIB}MiB"
+    parted -s "${PARTITION_TARGET}" mkpart HOME btrfs "${OVERLAY_END_MIB}MiB" 100%
+    parted -s "${PARTITION_TARGET}" set 1 esp on
+    parted -s "${PARTITION_TARGET}" name 1 EFI
+    parted -s "${PARTITION_TARGET}" name 2 ROOTS
+    parted -s "${PARTITION_TARGET}" name 3 OVERLAY
+    parted -s "${PARTITION_TARGET}" name 4 HOME
+fi
+
+# Determine partition path convention for the target device.
+if [[ -n "${DIRECT_DEVICE}" ]]; then
+    if [[ "${DIRECT_DEVICE}" =~ /dev/loop[0-9]+$ || "${DIRECT_DEVICE}" =~ /dev/nbd[0-9]+$ ]]; then
+        PART_SUFFIX="p"
+    else
+        PART_SUFFIX=""
+    fi
+    EFI_PART="${DIRECT_DEVICE}${PART_SUFFIX}1"
+    ROOTS_PART="${DIRECT_DEVICE}${PART_SUFFIX}2"
+    OVERLAY_PART="${DIRECT_DEVICE}${PART_SUFFIX}3"
+    HOME_PART="${DIRECT_DEVICE}${PART_SUFFIX}4"
+else
+    # Attach the raw image to a loop device so partitions are addressable as
+    # ${LOOP_DEV}pN. Requires a kernel with loop support (i.e. a real VM/host,
+    # not a container).
+    LOOP_DEV="$(losetup -fP --show "${RAW_IMG}")"
+    # The -P scan can race udev; make sure partition nodes (${LOOP_DEV}pN) exist.
+    partprobe "${LOOP_DEV}" 2>/dev/null || true
+    udevadm settle --timeout=10 2>/dev/null || sleep 2
+
+    EFI_PART="${LOOP_DEV}p1"
+    ROOTS_PART="${LOOP_DEV}p2"
+    OVERLAY_PART="${LOOP_DEV}p3"
+    HOME_PART="${LOOP_DEV}p4"
+fi
+
+# When running inside the builder VM against a virtio disk, the kernel may not
+# expose partition nodes synchronously. Wait until all four partitions appear.
+if [[ -n "${DIRECT_DEVICE}" && ! "${DIRECT_DEVICE}" =~ /dev/loop[0-9]+$ && ! "${DIRECT_DEVICE}" =~ /dev/nbd[0-9]+$ ]]; then
+    echo "Waiting for partitions on ${DIRECT_DEVICE}..."
+    for _ in $(seq 1 30); do
+        if [[ -b "${EFI_PART}" && -b "${ROOTS_PART}" && -b "${OVERLAY_PART}" && -b "${HOME_PART}" ]]; then
+            break
+        fi
+        sleep 1
+    done
+fi
 
 # Partition indexes for guestfish (1-based)
 EFI_IDX=1
@@ -151,7 +282,7 @@ ROOTS_IDX=2
 OVERLAY_IDX=3
 HOME_IDX=4
 
-ROOTS_TARGET="/dev/sda${ROOTS_IDX}"
+ROOTS_TARGET="${ROOTS_PART}"
 
 _secure_wipe_file() {
     local path="${1:-}"
@@ -178,23 +309,23 @@ if [[ "${ENCRYPT}" == true ]]; then
     fi
     printf '%s' "${pass}" > "${PASS_KEY_FILE}"
     # GRUB's cryptomount only supports PBKDF2 (not Argon2id) for LUKS2.
-    cryptsetup luksFormat --type luks2 --pbkdf pbkdf2 --label "${LUKS_NAME}" --key-file "${PASS_KEY_FILE}" "${LOOP_DEV}p${ROOTS_IDX}"
-    cryptsetup open --type luks2 --key-file "${PASS_KEY_FILE}" "${LOOP_DEV}p${ROOTS_IDX}" "${LUKS_NAME}"
+    cryptsetup --batch-mode luksFormat --type luks2 --pbkdf pbkdf2 --label "${LUKS_NAME}" --key-file "${PASS_KEY_FILE}" "${ROOTS_PART}"
+    cryptsetup open --type luks2 --key-file "${PASS_KEY_FILE}" "${ROOTS_PART}" "${LUKS_NAME}"
     _secure_wipe_file "${PASS_KEY_FILE}"
     ROOTS_TARGET="/dev/mapper/${LUKS_NAME}"
-    LUKS_UUID=$(cryptsetup luksUUID "${LOOP_DEV}p${ROOTS_IDX}")
+    LUKS_UUID=$(cryptsetup luksUUID "${ROOTS_PART}")
     echo "LUKS container opened: ${ROOTS_TARGET} (UUID: ${LUKS_UUID})"
 fi
 
 echo "Formatting partitions..."
-mkfs.vfat -F 32 -n EFI "${LOOP_DEV}p${EFI_IDX}"
-mkfs.btrfs -L OVERLAY "${LOOP_DEV}p${OVERLAY_IDX}"
-mkfs.btrfs -L HOME "${LOOP_DEV}p${HOME_IDX}"
+mkfs.vfat -F 32 -n EFI "${EFI_PART}"
+mkfs.btrfs -L OVERLAY "${OVERLAY_PART}"
+mkfs.btrfs -L HOME "${HOME_PART}"
 mkfs.btrfs -L ROOTS "${ROOTS_TARGET}"
 
 echo "Creating overlay subvolumes..."
 OVERLAY_TMP="$(mktemp -d)"
-mount "${LOOP_DEV}p${OVERLAY_IDX}" "${OVERLAY_TMP}"
+mount "${OVERLAY_PART}" "${OVERLAY_TMP}"
 btrfs subvolume create "${OVERLAY_TMP}/etc"
 btrfs subvolume create "${OVERLAY_TMP}/var"
 btrfs subvolume create "${OVERLAY_TMP}/usr"
@@ -208,7 +339,7 @@ rm -rf "${OVERLAY_TMP}"
 
 echo "Creating home subvolume on HOME partition..."
 HOME_TMP="$(mktemp -d)"
-mount "${LOOP_DEV}p${HOME_IDX}" "${HOME_TMP}"
+mount "${HOME_PART}" "${HOME_TMP}"
 btrfs subvolume create "${HOME_TMP}/home"
 umount "${HOME_TMP}"
 rm -rf "${HOME_TMP}"
@@ -224,7 +355,16 @@ elif [[ "${TARBALL}" == *.tar.gz || "${TARBALL}" == *.tgz ]]; then
     TAR_FLAGS="-xpzf"
 fi
 
-tar -C "${ROOTS_TMP}" ${TAR_FLAGS} "${TARBALL}"
+if [[ "${TARBALL}" =~ \.(img|squashfs)$ ]]; then
+    if ! command -v unsquashfs &> /dev/null; then
+        echo "Error: unsquashfs is required to extract a SquashFS archive."
+        exit 1
+    fi
+    unsquashfs -no-xattrs -f -d "${ROOTS_TMP}" "${TARBALL}"
+    chown -R root:root "${ROOTS_TMP}/etc" "${ROOTS_TMP}/var" "${ROOTS_TMP}/usr/lib/systemd" 2>/dev/null || true
+else
+    tar -C "${ROOTS_TMP}" ${TAR_FLAGS} "${TARBALL}"
+fi
 
 mkdir -p "${ROOTS_TMP}/overlay" "${ROOTS_TMP}/home" "${ROOTS_TMP}/boot/efi"
 
@@ -235,7 +375,7 @@ mkdir -p "${ROOTS_TMP}/var/lib/systemd" "${ROOTS_TMP}/var/lib/lastlog"
 
 echo "Seeding home subvolume from rootfs /home..."
 HOME_TMP="$(mktemp -d)"
-mount "${LOOP_DEV}p${HOME_IDX}" "${HOME_TMP}"
+mount "${HOME_PART}" "${HOME_TMP}"
 cp -a "${ROOTS_TMP}/home/." "${HOME_TMP}/home/"
 # The rootfs cleanup pass chowns uid-1000 files to root; restore the user
 # home to uid 1000 so the session can chdir into it.
@@ -303,11 +443,13 @@ echo "Running GRUB installation and initramfs rebuild inside chroot..."
 # Bind-mount targets may not exist in the extracted rootfs (e.g. empty /dev).
 mkdir -p "${ROOTS_TMP}/dev" "${ROOTS_TMP}/proc" "${ROOTS_TMP}/sys" \
     "${ROOTS_TMP}/run" "${ROOTS_TMP}/boot/efi"
-mount "${LOOP_DEV}p${EFI_IDX}" "${ROOTS_TMP}/boot/efi"
+mount "${EFI_PART}" "${ROOTS_TMP}/boot/efi"
 mount --bind /dev "${ROOTS_TMP}/dev"
 mount --bind /proc "${ROOTS_TMP}/proc"
 mount --bind /sys "${ROOTS_TMP}/sys"
 mount --bind /run "${ROOTS_TMP}/run"
+mkdir -p "${ROOTS_TMP}/tmp"
+mount -t tmpfs -o mode=1777,nodev,nosuid,size=2G tmpfs "${ROOTS_TMP}/tmp"
 
 # Unset TMPDIR so mkinitcpio inside the chroot does not try to use the
 # host-side temporary directory (which does not exist in the chroot).
@@ -391,17 +533,17 @@ cat >> "${ROOTS_TMP}/boot/efi/grub/grub.cfg" << GRUBEOF
 search --no-floppy --label --set=roots ROOTS
 
 menuentry "RegicideOSArch" {
-    linux (\$roots)/boot/vmlinuz-linux ${ROOTS_GRUB} quiet splash rw
+    linux (\$roots)/boot/vmlinuz-linux ${ROOTS_GRUB} quiet splash rw console=ttyS0,115200n8
     initrd (\$roots)/boot/initramfs-linux.img
 }
 
 menuentry "RegicideOSArch (Recovery)" {
-    linux (\$roots)/boot/vmlinuz-linux ${ROOTS_GRUB} quiet splash rw single
+    linux (\$roots)/boot/vmlinuz-linux ${ROOTS_GRUB} quiet splash rw single console=ttyS0,115200n8
     initrd (\$roots)/boot/initramfs-linux.img
 }
 
 menuentry "RegicideOSArch (Verbose)" {
-    linux (\$roots)/boot/vmlinuz-linux ${ROOTS_GRUB} verbose rw
+    linux (\$roots)/boot/vmlinuz-linux ${ROOTS_GRUB} verbose rw console=ttyS0,115200n8
     initrd (\$roots)/boot/initramfs-linux.img
 }
 GRUBEOF
@@ -419,13 +561,14 @@ cat > "${ROOTS_TMP}/etc/default/grub" << GRUBDEFAULT
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=5
 GRUB_DISTRIBUTOR="RegicideOSArch"
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash console=ttyS0,115200n8"
 GRUB_CMDLINE_LINUX="${GRUB_CMDLINE}"
 GRUB_ENABLE_CRYPTODISK=y
 GRUB_PRELOAD_MODULES="cryptodisk luks luks2 gcry_rijndael gcry_sha256 gcry_sha1 argon2 part_gpt lvm"
 GRUBDEFAULT
 
 echo "Unmounting chroot filesystems..."
+umount "${ROOTS_TMP}/tmp"  2>/dev/null || true
 umount "${ROOTS_TMP}/run"  2>/dev/null || true
 umount "${ROOTS_TMP}/sys"  2>/dev/null || true
 umount "${ROOTS_TMP}/proc" 2>/dev/null || true
@@ -440,18 +583,20 @@ fi
 
 rm -rf "${ROOTS_TMP}"
 
-echo "Converting raw image to QCOW2..."
-if command -v qemu-img >/dev/null 2>&1; then
-    qemu-img convert -f raw -O qcow2 "${RAW_IMG}" "${OUTPUT}"
-else
-    # No qemu-img available (e.g. inside a minimal builder VM): keep the raw
-    # image; convert on the host afterwards.
-    echo "qemu-img not found; leaving raw image at ${OUTPUT}"
-    mv "${RAW_IMG}" "${OUTPUT}"
-    RAW_IMG=""
-fi
+if [[ "${NO_CONVERT}" == false ]]; then
+    echo "Converting raw image to QCOW2..."
+    if command -v qemu-img >/dev/null 2>&1; then
+        qemu-img convert -f raw -O qcow2 "${RAW_IMG}" "${OUTPUT}"
+    else
+        # No qemu-img available (e.g. inside a minimal builder VM): keep the raw
+        # image; convert on the host afterwards.
+        echo "qemu-img not found; leaving raw image at ${OUTPUT}"
+        mv "${RAW_IMG}" "${OUTPUT}"
+        RAW_IMG=""
+    fi
 
-rm -f "${RAW_IMG}"
+    rm -f "${RAW_IMG}"
+fi
 
 RUNNER_PATH="${OUTPUT_DIR}/run-qemu.sh"
 cat > "${RUNNER_PATH}" << QEMUEOF
