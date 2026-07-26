@@ -7,6 +7,12 @@ from pathlib import Path
 import dagger
 
 
+# Cache-volume keys used by the seed/save helpers below.  Keeping the names
+# stable lets multiple pipeline runs share downloaded packages.
+PACMAN_CACHE_NAME = "regicide-arch-pacman"
+APK_CACHE_NAME = "regicide-arch-alpine"
+
+
 def cpu_count() -> int:
     """Return the number of host CPUs to expose to the build container."""
     return os.cpu_count() or 4
@@ -44,16 +50,133 @@ def project_source_directory(client: dagger.Client) -> dagger.Directory:
     )
 
 
+def _seed_cache(
+    container: dagger.Container,
+    client: dagger.Client,
+    cache_name: str,
+    mount_path: str,
+    target_path: str,
+) -> dagger.Container:
+    """Copy cached files from a cache volume into the container overlay.
+
+    Dagger >=0.21 does not cache execs that have a cache mount attached.  By
+    seeding the target directory from a cache volume and then detaching it, the
+    heavy package-manager operations become content-cacheable while still
+    reusing previously downloaded artifacts.
+    """
+    cache = client.cache_volume(cache_name)
+    return (
+        container
+        .with_mounted_cache(mount_path, cache)
+        .with_exec(["mkdir", "-p", target_path, mount_path])
+        .with_exec(
+            [
+                "sh",
+                "-c",
+                f"cp -au {mount_path}/. {target_path}/ 2>/dev/null || true",
+            ]
+        )
+        .without_mount(mount_path)
+    )
+
+
+def _save_cache(
+    container: dagger.Container,
+    client: dagger.Client,
+    cache_name: str,
+    mount_path: str,
+    source_path: str,
+) -> dagger.Container:
+    """Persist files from the container overlay back to a cache volume."""
+    cache = client.cache_volume(cache_name)
+    return (
+        container
+        .with_mounted_cache(mount_path, cache)
+        .with_exec(["mkdir", "-p", mount_path])
+        .with_exec(
+            [
+                "sh",
+                "-c",
+                f"cp -au {source_path}/. {mount_path}/ 2>/dev/null || true",
+            ]
+        )
+        .without_mount(mount_path)
+    )
+
+
+def seed_pacman_cache(
+    container: dagger.Container,
+    client: dagger.Client,
+    cache_name: str | None = None,
+) -> dagger.Container:
+    """Seed /var/cache/pacman/pkg from the persistent pacman cache volume."""
+    return _seed_cache(
+        container,
+        client,
+        cache_name or PACMAN_CACHE_NAME,
+        "/cache/pacman/pkg",
+        "/var/cache/pacman/pkg",
+    )
+
+
+def save_pacman_cache(
+    container: dagger.Container,
+    client: dagger.Client,
+    cache_name: str | None = None,
+) -> dagger.Container:
+    """Persist /var/cache/pacman/pkg back to the pacman cache volume."""
+    return _save_cache(
+        container,
+        client,
+        cache_name or PACMAN_CACHE_NAME,
+        "/cache/pacman/pkg",
+        "/var/cache/pacman/pkg",
+    )
+
+
+def seed_apk_cache(
+    container: dagger.Container,
+    client: dagger.Client,
+    cache_name: str | None = None,
+) -> dagger.Container:
+    """Seed /var/cache/apk from the persistent apk cache volume."""
+    return _seed_cache(
+        container,
+        client,
+        cache_name or APK_CACHE_NAME,
+        "/cache/apk",
+        "/var/cache/apk",
+    )
+
+
+def save_apk_cache(
+    container: dagger.Container,
+    client: dagger.Client,
+    cache_name: str | None = None,
+) -> dagger.Container:
+    """Persist /var/cache/apk back to the apk cache volume."""
+    return _save_cache(
+        container,
+        client,
+        cache_name or APK_CACHE_NAME,
+        "/cache/apk",
+        "/var/cache/apk",
+    )
+
+
 def arch_base_container(client: dagger.Client) -> dagger.Container:
-    """Return an Arch Linux base container with pacman keyring and mirrors ready."""
+    """Return an Arch Linux base container with pacman keyring and mirrors ready.
+
+    The pacman package cache is *not* mounted here.  Callers should seed the
+    cache before heavy package operations and save it afterwards so Dagger can
+    cache the expensive execs.
+    """
     jobs = cpu_count()
-    pacman_cache = client.cache_volume("regicide-arch-pacman")
 
     base = (
         client.container()
         .from_("archlinux:base-devel@sha256:9e9da3122b537ad94f22c8c6f89c1e3f253f3a1e22944364a061c75a041705da")
         .with_env_variable("MAKEFLAGS", f"-j{jobs}")
-        .with_mounted_cache("/var/cache/pacman/pkg", pacman_cache)
     )
 
     return (

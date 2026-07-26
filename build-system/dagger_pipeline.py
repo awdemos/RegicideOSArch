@@ -123,7 +123,13 @@ async def build_arch_cosmic(
 
     src = dagger_common.project_source_directory(client)
     base = dagger_common.arch_base_container(client)
-    with_packages = dagger_common.install_packages(base, "vm")
+
+    # Seed the pacman package cache into the container overlay, run the heavy
+    # package install, then persist the cache.  We save again after post-install
+    # so any additional packages downloaded there are also cached.
+    seeded = dagger_common.seed_pacman_cache(base, client)
+    with_packages = dagger_common.install_packages(seeded, "vm")
+    with_packages = dagger_common.save_pacman_cache(with_packages, client)
 
     nvidia_flag = "1" if enable_nvidia else "0"
     flatpaks_flag = "1" if defer_flatpaks else "0"
@@ -136,6 +142,7 @@ async def build_arch_cosmic(
             "REGICIDE_DEFER_FLATPAKS": flatpaks_flag,
         },
     )
+    with_post = dagger_common.save_pacman_cache(with_post, client)
 
     # post-install.d/99-finalize.sh already runs mkinitcpio -P; the encrypted
     # image builder also runs it inside the chroot. Do not regenerate it here.
@@ -156,13 +163,18 @@ async def build_iso(
 ) -> dagger.File:
     """Create a SquashFS image from a stage4 tarball for live ISO use."""
 
-    alpine_cache = client.cache_volume("regicide-arch-alpine")
-
     builder = (
         client.container()
         .from_("alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b")
-        .with_mounted_cache("/var/cache/apk", alpine_cache)
-        .with_exec(["apk", "add", "squashfs-tools", "tar", "xz"])
+    )
+
+    # Seed/save the apk cache so the package install is content-cacheable.
+    builder = dagger_common.seed_apk_cache(builder, client)
+    builder = builder.with_exec(["apk", "add", "squashfs-tools", "tar", "xz"])
+    builder = dagger_common.save_apk_cache(builder, client)
+
+    builder = (
+        builder
         .with_file("/tmp/regicide-arch.tar.xz", tarball)
         .with_exec(["mkdir", "-p", "/tmp/rootfs"])
         .with_exec([
@@ -196,14 +208,19 @@ async def build_live_iso(
         dagger_common.arch_base_container(client)
         .with_file("/tmp/regicide-arch.tar.xz", tarball)
         .with_exec(["sh", "-c", "tar -C / -xpJf /tmp/regicide-arch.tar.xz --exclude=proc --exclude=sys --exclude=dev --exclude=opt --exclude=.init --exclude=etc/hosts --exclude=etc/resolv.conf --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./opt --exclude=./.init --exclude=./etc/hosts --exclude=./etc/resolv.conf && rm /tmp/regicide-arch.tar.xz"])
-        .with_exec(["pacman", "-S", "--noconfirm", "--needed", "dracut", "squashfs-tools"])
-        .with_exec([
-            "sh", "-c",
-            "set -e; mkdir -p /work; kver=$(ls /lib/modules | head -1); "
-            "cp /boot/vmlinuz-linux /work/vmlinuz; "
-            "dracut --force --no-hostonly --add 'dmsquash-live' /work/initramfs.img ${kver}",
-        ], insecure_root_capabilities=True)
     )
+
+    # Seed/save the pacman cache so the dracut package install is cacheable.
+    initrd_builder = dagger_common.seed_pacman_cache(initrd_builder, client)
+    initrd_builder = initrd_builder.with_exec(["pacman", "-S", "--noconfirm", "--needed", "dracut", "squashfs-tools"])
+    initrd_builder = dagger_common.save_pacman_cache(initrd_builder, client)
+
+    initrd_builder = initrd_builder.with_exec([
+        "sh", "-c",
+        "set -e; mkdir -p /work; kver=$(ls /lib/modules | head -1); "
+        "cp /boot/vmlinuz-linux /work/vmlinuz; "
+        "dracut --force --no-hostonly --add 'dmsquash-live' /work/initramfs.img ${kver}",
+    ], insecure_root_capabilities=True)
 
     # 2. Assemble the ISO tree and run grub-mkrescue.
     grub_cfg = """set timeout=5
@@ -273,8 +290,8 @@ async def build_qcow2_locally(
     if encrypt:
         passphrase = _get_luks_passphrase(
             passphrase_file=passphrase_file,
-            memorable=args.memorable_passphrase,
-            otp_style=args.otp_style_passphrase,
+            memorable=memorable,
+            otp_style=otp_style,
         )
         # Stage the passphrase in /dev/shm with 0600 permissions and no trailing
         # newline so cryptsetup reads the exact human passphrase.  Do not use
@@ -282,11 +299,11 @@ async def build_qcow2_locally(
         fd, passphrase_tmp = tempfile.mkstemp(
             prefix="regicide-luks-", dir="/dev/shm", text=True
         )
+        os.fchmod(fd, 0o600)
         passphrase_file = Path(passphrase_tmp)
         with os.fdopen(fd, "w") as f:
             f.write(passphrase)
-        os.fchmod(fd, 0o600)
-        cmd[1:1] = ["--encrypt", "--passphrase-file", str(passphrase_file)]
+        cmd[2:2] = ["--encrypt", "--passphrase-file", str(passphrase_file)]
         print(f"Building encrypted QCOW2 image: {output_path}")
     else:
         print(f"Building unencrypted QCOW2 image: {output_path}")
