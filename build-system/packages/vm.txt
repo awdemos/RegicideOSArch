@@ -13,9 +13,12 @@ pipewire-jack
 pipewire-pulse
 wireplumber
 cosmic
+gptfdisk
 flatpak
 xdg-utils
 podman
 distrobox
 qemu-guest-agent
 spice-vdagent
+lvm2
+thin-provisioning-tools

@@ -1,0 +1,126 @@
+#!/bin/bash
+# PID 1 entrypoint for the UltraWork workspace container on Fly.io.
+# Reads workspace config from env/file secrets, sets up the user, and
+# supervises sshd + the opencode agent. Persists all state under /data.
+
+set -euo pipefail
+
+: "${ULTRAWORK_WORKSPACE_ID:?ULTRAWORK_WORKSPACE_ID is required}"
+: "${ULTRAWORK_USER_EMAIL:?ULTRAWORK_USER_EMAIL is required}"
+: "${ULTRAWORK_SSH_PUBLIC_KEY:?ULTRAWORK_SSH_PUBLIC_KEY is required}"
+
+USER_NAME="uwuser"
+USER_UID="1000"
+DATA_DIR="/data"
+SSH_DATA_DIR="${DATA_DIR}/etc/ssh"
+HOME_DIR="${DATA_DIR}/home/${USER_NAME}"
+WORKSPACE_DIR="${DATA_DIR}/workspace"
+
+log() {
+  echo "[ultrawork-init] $*"
+}
+
+setup_data_dirs() {
+  mkdir -p "${DATA_DIR}"
+  mkdir -p "${SSH_DATA_DIR}"
+  mkdir -p "${HOME_DIR}"
+  mkdir -p "${WORKSPACE_DIR}"
+  mkdir -p /var/log
+}
+
+setup_user() {
+  # If the user exists, update its home directory to the persisted path.
+  if id -u "${USER_NAME}" > /dev/null 2>&1; then
+    usermod -d "${HOME_DIR}" "${USER_NAME}" || true
+  else
+    useradd -m -d "${HOME_DIR}" -s /bin/bash -u "${USER_UID}" "${USER_NAME}"
+  fi
+
+  # Ensure home directory ownership.
+  chown "${USER_NAME}:${USER_NAME}" "${HOME_DIR}"
+  chown "${USER_NAME}:${USER_NAME}" "${WORKSPACE_DIR}"
+
+  # Install SSH authorized key.
+  local ssh_dir="${HOME_DIR}/.ssh"
+  mkdir -p "${ssh_dir}"
+  printf '%s\n' "${ULTRAWORK_SSH_PUBLIC_KEY}" > "${ssh_dir}/authorized_keys"
+  chown -R "${USER_NAME}:${USER_NAME}" "${ssh_dir}"
+  chmod 700 "${ssh_dir}"
+  chmod 600 "${ssh_dir}/authorized_keys"
+
+  # Persist host keys so they survive container restarts.
+  if [ ! -f "${SSH_DATA_DIR}/ssh_host_ed25519_key" ]; then
+    ssh-keygen -t ed25519 -f "${SSH_DATA_DIR}/ssh_host_ed25519_key" -N ''
+    ssh-keygen -t rsa -b 4096 -f "${SSH_DATA_DIR}/ssh_host_rsa_key" -N ''
+  fi
+  cp -f "${SSH_DATA_DIR}"/ssh_host_* /etc/ssh/
+  chmod 600 /etc/ssh/ssh_host_*_key
+}
+
+write_agent_config() {
+  local config_dir="${HOME_DIR}/.opencode"
+  mkdir -p "${config_dir}"
+
+  # PoC: deny bash/network; restrict file writes to /data/workspace.
+  # Hardened version will route tool calls through the credential proxy.
+  cat > "${config_dir}/opencode.json" <<'EOF'
+{
+  "bash": "deny",
+  "network": "deny",
+  "file_write": "/data/workspace",
+  "allowed_services": []
+}
+EOF
+  chown -R "${USER_NAME}:${USER_NAME}" "${config_dir}"
+}
+
+start_services() {
+  log "Starting sshd on port 22"
+  /usr/bin/sshd -E /var/log/sshd.log
+
+  log "Starting opencode-agent"
+  local agent_log="/var/log/opencode-agent.log"
+  touch "${agent_log}"
+  chown "${USER_NAME}:${USER_NAME}" "${agent_log}"
+
+  # Run the agent as the workspace user in the background.
+  # The PoC runs `opencode agent` in a loop so the container stays alive even
+  # if the agent command is not yet stable. Hardened version will use a
+  # proper supervisor (e.g. s6, supervisord) or the Fly.io service mechanism.
+  (
+    while true; do
+      su - "${USER_NAME}" -c "opencode agent --log-file ${agent_log}" || true
+      log "Agent exited; restarting in 5s"
+      sleep 5
+    done
+  ) &
+  AGENT_PID=$!
+}
+
+shutdown_services() {
+  log "Shutting down"
+  if [ -n "${AGENT_PID:-}" ] && kill -0 "${AGENT_PID}" 2> /dev/null; then
+    kill -TERM "${AGENT_PID}" || true
+  fi
+  pkill -TERM sshd || true
+  sleep 1
+  pkill -KILL sshd || true
+}
+
+trap 'shutdown_services; exit 0' TERM INT
+
+log "Booting workspace ${ULTRAWORK_WORKSPACE_ID} for ${ULTRAWORK_USER_EMAIL}"
+setup_data_dirs
+setup_user
+write_agent_config
+start_services
+
+log "Workspace running. Waiting for signal."
+# Keep the container alive. sshd handles connections; the agent loop runs in the background.
+while true; do
+  sleep 60
+  if ! pgrep -x sshd > /dev/null; then
+    log "sshd is not running; exiting"
+    exit 1
+  fi
+done
