@@ -321,6 +321,34 @@ luks_checks_enabled() {
     [[ "${REGICIDE_FORCE_LUKS_CHECKS:-0}" == "1" ]]
 }
 
+check_luks_keyfile_leak() {
+    # Security: fail when a plaintext LUKS keyfile is embedded in the
+    # initramfs.  Adapted from RegicideOS's lsinitrd/dracut check to
+    # Arch's mkinitcpio (lsinitcpio) tooling.
+    local outpath="${DIAG_DIR}/luks-keyfile-in-initramfs.txt"
+    echo "Checking for plaintext keyfile leak in initramfs..."
+    local initrd
+    initrd="$(run_ssh '{ ls /boot/initramfs-linux.img 2>/dev/null || ls /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null; } | head -n1' 2>/dev/null || true)"
+    if [[ -z "${initrd}" ]]; then
+        echo "no-initramfs" > "${outpath}"
+        echo "SKIP luks-keyfile-in-initramfs (no initramfs found)"
+        return 0
+    fi
+    if ! run_ssh "command -v lsinitcpio >/dev/null 2>&1" >/dev/null 2>&1; then
+        echo "no-lsinitcpio" > "${outpath}"
+        echo "SKIP luks-keyfile-in-initramfs (lsinitcpio not available in VM)"
+        return 0
+    fi
+    if run_ssh "lsinitcpio '${initrd}' 2>/dev/null | grep -q '/etc/luks-keyfile'" >"${outpath}" 2>&1; then
+        echo "FAIL luks-keyfile-in-initramfs (plaintext keyfile present in ${initrd})"
+        echo "leaked" >> "${outpath}"
+        return 1
+    fi
+    echo "ok" > "${outpath}"
+    echo "PASS luks-keyfile-in-initramfs"
+    return 0
+}
+
 checks=(
     # 1-3. Distrobox container lifecycle (create, enter, remove)
     "distrobox-create-enter-rm:export HOME=/home/regicide XDG_RUNTIME_DIR=/run/user/1000; rm -rf /home/regicide/.local/share/containers /var/tmp/regicide-distrobox-* /run/user/1000/libpod /run/user/1000/containers 2>/dev/null || true; distrobox rm regicide-smoke-alpine --force >/dev/null 2>&1 || true; timeout 120 podman pull docker.io/library/alpine >/dev/null 2>&1; pull_rc=\$?; timeout 300 distrobox create --image docker.io/library/alpine --name regicide-smoke-alpine --yes >/dev/null 2>&1; create_rc=\$?; timeout 120 distrobox enter regicide-smoke-alpine -- whoami >/tmp/dbox-enter.log 2>&1; enter_rc=\$?; timeout 60 distrobox rm regicide-smoke-alpine --force >/dev/null 2>&1; rm_rc=\$?; echo pull_rc=\${pull_rc} create_rc=\${create_rc} enter_rc=\${enter_rc} rm_rc=\${rm_rc}; test \${pull_rc} -eq 0 && test \${create_rc} -eq 0 && test \${enter_rc} -eq 0 && grep -qx regicide /tmp/dbox-enter.log && test \${rm_rc} -eq 0 && echo distrobox-lifecycle-ok:distrobox-lifecycle-ok"
@@ -364,12 +392,10 @@ checks=(
     # 11. NVIDIA userspace stack (best-effort in a VM without GPU)
     "nvidia-smi:command -v nvidia-smi >/dev/null 2>&1 && (nvidia-smi >/tmp/nvidia-smi.log 2>&1 && grep -q NVIDIA-SMI /tmp/nvidia-smi.log && echo nvidia-ok || grep -Eiq 'nvml|driver|gpu|device' /tmp/nvidia-smi.log && echo nvidia-ok) || echo nvidia-missing"
 
-    # 12. LUKS state checks (conditional on encrypted image name or override).
-    "luks-dm-device-exists:luks_checks_enabled || exit 0; test -L /dev/mapper/regicide-arch && echo dm-ok:dm-ok"
-    "luks-cryptsetup-status:luks_checks_enabled || exit 0; sudo -n cryptsetup status regicide-arch | grep -q 'type:.*LUKS2' && echo luks2-ok:luks2-ok"
-    "luks-keyslot-list:luks_checks_enabled || exit 0; device=\"\$(cryptsetup status regicide-arch 2>/dev/null | awk '/device:/ {print \$2}')\"; [[ -n \"\${device}\" ]] && sudo -n cryptsetup luksDump \"\${device}\" | grep -E '^[[:space:]]*[0-9]+:.*LUKS' && echo keyslots-ok:keyslots-ok"
-    "luks-root-mounted-via-dm:luks_checks_enabled || exit 0; findmnt -n -o SOURCE / | grep -q '^/dev/mapper/regicide-arch$' && echo root-dm-ok:root-dm-ok"
-    "luks-roots-partition-type:luks_checks_enabled || exit 0; lsblk -f | grep -q 'crypto_LUKS' && echo luks-partition-ok:luks-partition-ok"
+    # 11b. regicide-update smoke checks (ported from RegicideOS f15131ff).
+    # Both skip cleanly when the tool or the pacman sync databases are absent.
+    "regicide-update-requires-root:(regicide-update --help 2>&1 || true) | grep -qi 'requires root' && echo requires-root || echo regicide-update-skipped"
+    "regicide-update-search-works:sudo -n regicide-update search bash 2>/dev/null | grep -q 'core/bash' && echo search-ok || echo regicide-update-skipped"
 
     # 13. Extended BTRFS layout checks (applicable to both encrypted and unencrypted images).
     "btrfs-roots-label:findmnt -n -o LABEL / | grep -q ROOTS && echo roots-label:roots-label"
@@ -396,6 +422,20 @@ checks=(
     "root-password:getent passwd root | grep -q root && echo root-ok:root-ok"
 )
 
+# 12. LUKS state checks, gated on the host.  luks_checks_enabled is a local
+# shell function and does not exist inside the SSH session, so the gate must
+# be evaluated here instead of inside the remote command strings.  Check
+# commands must not contain ':' because entries are split on IFS=':'.
+if luks_checks_enabled; then
+    checks+=(
+        "luks-dm-device-exists:test -L /dev/mapper/regicide-arch && echo dm-ok:dm-ok"
+        "luks-cryptsetup-status:sudo -n cryptsetup status regicide-arch | grep -q 'type.*LUKS2' && echo luks2-ok:luks2-ok"
+        "luks-keyslot-list:device=\"\$(cryptsetup status regicide-arch 2>/dev/null | awk '/device/ {print \$2}')\"; [[ -n \"\${device}\" ]] && sudo -n cryptsetup luksDump \"\${device}\" | grep -Ei '^ *[0-9]+..*luks' && echo keyslots-ok:keyslots-ok"
+        "luks-root-mounted-via-dm:findmnt -n -o SOURCE / | grep -q '^/dev/mapper/regicide-arch$' && echo root-dm-ok:root-dm-ok"
+        "luks-roots-partition-type:lsblk -f | grep -q 'crypto_LUKS' && echo luks-partition-ok:luks-partition-ok"
+    )
+fi
+
 failures=""
 for entry in "${checks[@]}"; do
     IFS=':' read -r label cmd expect <<< "${entry}"
@@ -418,6 +458,12 @@ done
 run_ssh "dmesg 2>/dev/null | head -n 200" > "${DIAG_DIR}/dmesg.txt" 2>&1 || true
 run_ssh "journalctl -b --no-pager | head -n 500" > "${DIAG_DIR}/journal.txt" 2>&1 || true
 run_ssh "systemctl status --no-pager -l" > "${DIAG_DIR}/services.txt" 2>&1 || true
+
+if luks_checks_enabled; then
+    if ! check_luks_keyfile_leak; then
+        failures="${failures},luks-keyfile-in-initramfs"
+    fi
+fi
 
 if [[ -n "${failures}" ]]; then
     echo "FAILED_CHECKS=${failures#,}"
