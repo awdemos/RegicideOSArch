@@ -8,6 +8,8 @@
 
 > ⚠️ **Development Status**: The Dagger build pipeline produces a bootable Arch-based rootfs, SquashFS live image, and QCOW2 VM image. COSMIC boots to a greeter, the `regicide` user can log in, and core apps (podman, distrobox, Rio, NVIDIA open drivers) are pre-installed. The ARM64 build is tested on NVIDIA Spark. This is a side project of the main [RegicideOS](https://github.com/awdemos/RegicideOS) effort and is not the primary distribution.
 
+> **Latest release**: [RegicideOS v0.0.1](https://github.com/awdemos/RegicideOS/releases/tag/v0.0.1) — includes a prebuilt `regicide-arch.iso` live ISO, released in split chunks with SHA256 checksums because GitHub caps individual assets at 2 GiB.
+
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-1793D1?style=for-the-badge&logo=arch-linux&logoColor=white)](https://archlinux.org/)
 [![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://kernel.org/)
@@ -65,7 +67,7 @@ build-system/
 
 ## 📥 Installation / Build
 
-> **Note**: There is currently **no bootable ISO**. The build system produces a local SquashFS image and a bootable QCOW2 VM image. You can boot the QCOW2 directly in a VM.
+> **Note**: The pipeline produces a compressed rootfs tarball, a SquashFS live image, a bootable QCOW2 VM image, and — with `--iso` — a bootable live ISO (`build-system/arch/output/regicide-arch.iso`). A prebuilt live ISO is also available in [v0.0.1](https://github.com/awdemos/RegicideOS/releases/tag/v0.0.1).
 
 ### Requirements
 
@@ -74,6 +76,15 @@ build-system/
 - UEFI firmware (or OVMF for VMs)
 - Internet connection
 - Docker or Podman for Dagger
+
+> **Note:** the Dagger engine image needs to create the `dagger0` bridge, so it
+> cannot run under **rootless Podman**. If your default `docker` endpoint is a
+> rootless Podman socket, start the rootful Podman socket and point Dagger at it:
+>
+> ```bash
+> sudo systemctl enable --now podman.socket
+> DOCKER_HOST=unix:///run/podman/podman.sock sudo -E dagger run python build-system/dagger_pipeline.py --plain
+> ```
 
 ### Build from Source
 
@@ -95,7 +106,36 @@ Outputs:
 - `build-system/arch/output/regicide-arch.img` — live SquashFS image
 - `build-system/arch/output/regicide-arch.qcow2` — bootable VM disk
 
-#### 3. Boot the image
+> **Note**: `regicide-arch.img` is **not** a bootable USB image; it is the live SquashFS payload (the ROOTS filesystem). The bootable USB/VM image is the ISO, built with `--iso`.
+
+#### 3. Try the prebuilt live ISO
+
+Download the split ISO chunks from the [v0.0.1 release](https://github.com/awdemos/RegicideOS/releases/tag/v0.0.1), reassemble, and verify:
+
+```bash
+cat regicide-arch.iso.part* > regicide-arch.iso
+sha256sum -c regicide-arch.iso.sha256
+```
+
+The ISO boots under UEFI in QEMU/virt-manager or can be written to a USB drive to boot on bare metal. Identify the USB device (`/dev/sdX`), unmount any partitions on it, and write the ISO:
+
+```bash
+sudo umount /dev/sdX*
+sudo dd if=regicide-arch.iso of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+**Regenerate the live ISO from an existing build:**
+
+If you already have a tarball and SquashFS and want a matching bootable ISO without a full rebuild, reuse them:
+
+```bash
+DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --plain \
+  --iso \
+  --from-tarball build-system/arch/output/regicide-arch.tar.xz \
+  --from-squashfs build-system/arch/output/regicide-arch.img
+```
+
+#### 4. Boot the image
 
 ```bash
 sudo ./build-system/arch/output/run-qemu.sh
@@ -128,7 +168,28 @@ Then open `http://localhost:6081/vnc.html?host=localhost&port=6081&autoconnect=t
 
 > **Default credentials**: `regicide` / `regicide`. Root password is also `regicide`; change it immediately on first boot.
 
-#### 4. Build options
+#### 5. Boot the live ISO with VNC
+
+You can boot the live ISO headlessly and attach a VNC viewer to watch the COSMIC greeter come up:
+
+```bash
+cp /usr/share/OVMF/OVMF_VARS.fd /tmp/regicide-iso-vars.fd
+chmod u+w /tmp/regicide-iso-vars.fd
+qemu-img create -f qcow2 /tmp/regicide-iso-test.qcow2 30G
+qemu-system-x86_64 -enable-kvm -m 8G -smp 4 -cpu host \
+    -machine type=q35,accel=kvm \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+    -drive if=pflash,format=raw,file=/tmp/regicide-iso-vars.fd \
+    -cdrom build-system/arch/output/regicide-arch.iso \
+    -drive file=/tmp/regicide-iso-test.qcow2,format=qcow2,if=virtio \
+    -netdev user,id=net0,hostfwd=tcp::2225-:22 \
+    -device virtio-net-pci,netdev=net0 \
+    -vga std -vnc :0
+```
+
+Then connect any VNC client to `localhost:5900` and log in as `regicide` / `regicide` over forwarded SSH on port `2225`.
+
+#### 6. Build options
 
 | Flag | Purpose |
 |------|---------|
@@ -136,6 +197,9 @@ Then open `http://localhost:6081/vnc.html?host=localhost&port=6081&autoconnect=t
 | `--no-defer-flatpaks` | Install all Flatpak apps during the image build instead of on first boot. |
 | `--qcow2-size SIZE` | Set the output disk size, e.g. `30G` (default: `20G`). |
 | `--qcow2-output PATH` | Set a custom output path for the QCOW2 image. |
+| `--iso` | Also build a bootable live ISO (`build-system/arch/output/regicide-arch.iso`). |
+| `--from-tarball PATH` | Reuse an existing tarball instead of rebuilding it in Dagger. |
+| `--from-squashfs PATH` | Reuse an existing SquashFS image instead of rebuilding it in Dagger. |
 
 Examples:
 
@@ -147,7 +211,7 @@ DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --qcow2 
 DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --encrypt
 ```
 
-#### 5. Image builder environment variables
+#### 7. Image builder environment variables
 
 The QCOW2 builders read optional environment variables to size partitions. Defaults preserve the original layout.
 

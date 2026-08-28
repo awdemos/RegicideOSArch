@@ -33,6 +33,21 @@ Install Dagger and make sure you have a working Docker/Podman environment:
 curl -fsSL https://dl.dagger.io/dagger/install.sh | bash
 ```
 
+> **Note:** the Dagger engine image needs to create the `dagger0` bridge, so it
+> cannot run under **rootless Podman**. Use a rootful Docker or Podman runtime.
+> If your default `docker` endpoint is rootless Podman, start the rootful socket:
+>
+> ```bash
+> sudo systemctl enable --now podman.socket
+> DOCKER_HOST=unix:///run/podman/podman.sock sudo -E dagger run python build-system/dagger_pipeline.py --plain
+> ```
+>
+> When running under `sudo`, use the full path to the Dagger CLI (e.g.
+> `~/.local/bin/dagger`) because `sudo` resets `PATH`, and invoke the pipeline
+> with the Python interpreter that has the `dagger` package installed (e.g.
+> `.venv/bin/python` if you use a virtualenv) rather than the bare system
+> `python`.
+
 ### Build COSMIC Desktop
 
 ```bash
@@ -41,6 +56,8 @@ dagger run python build-system/dagger_pipeline.py
 ```
 
 This produces `regicide-arch.img`, a SquashFS live image in the current directory.
+The `.img` is **not** a bootable USB image; it is the ROOTS filesystem payload.
+For a bootable live ISO (`build-system/arch/output/regicide-arch.iso`), pass `--iso`.
 
 ### Build an Unencrypted QCOW2 Disk Image
 
@@ -92,6 +109,16 @@ The pipeline is a Python script using the Dagger SDK. It:
 7. Optionally exports the tarball to `build-system/arch/output/` and runs a host-side QCOW2 builder:
    - `--qcow2` uses `build-qemu-image-guestfish.sh` (no loop devices, systemd-boot).
    - `--encrypt` uses `build-qemu-image.sh` (loop devices, GRUB, LUKS2).
+8. With `--iso`, builds a bootable live ISO (GRUB + dracut dmsquash-live) and exports it to `build-system/arch/output/regicide-arch.iso`.
+
+To regenerate the ISO from an existing tarball and SquashFS without a full rebuild:
+
+```bash
+DAGGER_PROGRESS=plain dagger run python build-system/dagger_pipeline.py --plain \
+  --iso \
+  --from-tarball build-system/arch/output/regicide-arch.tar.xz \
+  --from-squashfs build-system/arch/output/regicide-arch.img
+```
 
 ### Caching
 
@@ -99,6 +126,17 @@ Two Dagger cache volumes speed up repeated runs:
 
 - `regicide-arch-pacman` — cached package downloads (`/var/cache/pacman/pkg`)
 - `regicide-arch-alpine` — cached Alpine packages for the SquashFS stage
+
+## Troubleshooting
+
+- **Cache volume preservation**: the cache volumes above live in the Dagger
+  engine container's `/var/lib/dagger` volume. If the engine container is
+  recreated without reusing that volume, the pacman cache is lost and the next
+  build re-downloads every package.
+- **Wedged engine after suspend/resume**: Podman can report the engine
+  container as "Up" while it is actually not running. Remove and recreate the
+  engine container with the same `/var/lib/dagger` volume; a plain
+  `podman restart` can fail with stale netavark/nftables state.
 
 ## Image Builders
 
