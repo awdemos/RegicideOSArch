@@ -16,6 +16,8 @@ import argparse
 import asyncio
 import getpass
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -72,6 +74,45 @@ def _generate_random_passphrase() -> str:
     """Return a high-entropy random passphrase."""
     import secrets
     return secrets.token_urlsafe(24)
+
+
+def _check_container_runtime() -> None:
+    """Fail fast if the local container runtime is rootless Podman or Docker.
+
+    Dagger's engine image must create the 'dagger0' bridge, which rootless
+    Podman cannot do. The Dagger SDK/CLI retry the connection for ~10 minutes
+    before surfacing the real error, so an explicit up-front check saves time.
+    If docker is unavailable or its info cannot be read, we skip the check:
+    the user may be targeting a remote engine via _EXPERIMENTAL_DAGGER_RUNNER_HOST.
+    """
+    if os.environ.get("_EXPERIMENTAL_DAGGER_RUNNER_HOST"):
+        return
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+    if result.returncode != 0:
+        return
+    output = result.stdout.lower()
+    # Podman rootless reports a standalone "rootless" line under Security Options.
+    # Docker rootless reports "rootless: true".
+    if re.search(r"^\s*rootless\s*$", output, re.MULTILINE) or "rootless: true" in output:
+        print(
+            "ERROR: Rootless Podman is not supported by the Dagger engine.\n"
+            "The engine needs to create the 'dagger0' bridge, which requires root.\n"
+            "Start the rootful Podman socket and re-run with:\n\n"
+            "  sudo systemctl enable --now podman.socket\n"
+            "  DOCKER_HOST=unix:///run/podman/podman.sock sudo -E \\\n"
+            "      dagger run python build-system/dagger_pipeline.py --plain\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _get_luks_passphrase(
@@ -160,6 +201,8 @@ async def build_arch_cosmic(
 async def build_iso(
     client: dagger.Client,
     tarball: dagger.File,
+    compression_level: int = 15,
+    processors: int = 4,
 ) -> dagger.File:
     """Create a SquashFS image from a stage4 tarball for live ISO use."""
 
@@ -182,7 +225,8 @@ async def build_iso(
         ])
         .with_exec([
             "mksquashfs", "/tmp/rootfs", "/tmp/regicide-arch.img",
-            "-comp", "zstd", "-Xcompression-level", "19",
+            "-comp", "zstd", "-Xcompression-level", str(compression_level),
+            "-processors", str(processors),
         ])
     )
 
@@ -273,16 +317,40 @@ async def _dagger_keepalive(client: dagger.Client, interval: float = 30.0) -> No
 
 
 def _stop_dagger_engine() -> None:
-    """Stop the Dagger engine container to free memory before a long-running
-    host-side step (the encrypted image builder boots its own KVM VM)."""
-    engine = "dagger-engine-v0.21.7"
+    """Stop any running Dagger engine containers to free memory before a
+    long-running host-side step (the encrypted image builder boots its own KVM VM)."""
     try:
-        subprocess.run(
-            ["docker", "stop", "-t", "30", engine],
+        result = subprocess.run(
+            ["docker", "ps", "-q", "-f", "name=^/dagger-engine-"],
             check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
         )
+        for engine_id in result.stdout.splitlines():
+            if engine_id:
+                subprocess.run(
+                    ["docker", "stop", "-t", "30", engine_id],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+    except FileNotFoundError:
+        pass
+
+
+def _secure_wipe(path: Path) -> None:
+    """Best-effort overwrite of a file before unlinking it."""
+    try:
+        with open(path, "rb+") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(0)
+            f.write(b"\x00" * size)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    try:
+        path.unlink()
     except FileNotFoundError:
         pass
 
@@ -303,7 +371,7 @@ async def build_qcow2_locally(
     The encrypted image uses build-vm-image.sh, which boots a KVM appliance to
     avoid host loop devices. The plain image uses build-qemu-image-guestfish.sh,
     which requires no host loop devices or passwordless sudo beyond the sudo it
-    invokes itself. Default disk size is 30G to fit the 8+GiB uncompressed
+    invokes itself. Default disk size is 20G to fit the 8+GiB uncompressed
     COSMIC rootfs plus overlay and home partitions.
     """
     if encrypt:
@@ -313,10 +381,13 @@ async def build_qcow2_locally(
     if not script.exists():
         raise FileNotFoundError(f"Image builder script not found: {script}")
 
+    env = os.environ.copy()
+
     cmd: list[str] = [
         str(script),
     ]
 
+    generated_passphrase_file: Path | None = None
     if encrypt:
         passphrase = _get_luks_passphrase(
             passphrase_file=passphrase_file,
@@ -324,23 +395,25 @@ async def build_qcow2_locally(
             otp_style=otp_style,
         )
         # Stage the passphrase in /dev/shm with 0600 permissions and no trailing
-        # newline so cryptsetup reads the exact human passphrase.  Do not use
-        # REGICIDE_LUKS_PASSPHRASE in child processes.
+        # newline so cryptsetup reads the exact human passphrase. Write it in
+        # binary mode because cryptsetup --key-file consumes the file verbatim.
         fd, passphrase_tmp = tempfile.mkstemp(
-            prefix="regicide-luks-", dir="/dev/shm", text=True
+            prefix="regicide-luks-", dir="/dev/shm"
         )
         os.fchmod(fd, 0o600)
-        passphrase_file = Path(passphrase_tmp)
-        with os.fdopen(fd, "w") as f:
-            f.write(passphrase)
+        generated_passphrase_file = Path(passphrase_tmp)
+        with os.fdopen(fd, "wb") as f:
+            f.write(passphrase.encode("utf-8"))
         cmd += [
             "--encrypt",
             "--passphrase-file",
-            str(passphrase_file),
+            str(generated_passphrase_file),
         ]
         if squashfs_path is not None:
             cmd += ["--squashfs", str(squashfs_path)]
         print(f"Building encrypted QCOW2 image: {output_path}")
+        # Do not let the passphrase escape into the builder's environment.
+        env.pop("REGICIDE_LUKS_PASSPHRASE", None)
     else:
         print(f"Building unencrypted QCOW2 image: {output_path}")
 
@@ -355,7 +428,7 @@ async def build_qcow2_locally(
             ping = asyncio.create_task(_dagger_keepalive(client))
         else:
             ping = None
-        proc = await asyncio.create_subprocess_exec(*cmd)
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
         try:
             await proc.wait()
         finally:
@@ -368,13 +441,89 @@ async def build_qcow2_locally(
             if proc.returncode != 0:
                 raise subprocess.CalledProcessError(proc.returncode, cmd)
     finally:
-        if passphrase_file is not None:
-            try:
-                passphrase_file.unlink()
-            except FileNotFoundError:
-                pass
+        if generated_passphrase_file is not None:
+            _secure_wipe(generated_passphrase_file)
 
     print(f"QCOW2 image complete: {output_path}")
+
+
+CHUNK_SIZE = "2G"
+_CHUNK_RETRIES = 3
+
+
+async def _export_file_with_retry(file: dagger.File, dest: Path) -> None:
+    """Export a single file, retrying transient Dagger transport errors."""
+    for attempt in range(_CHUNK_RETRIES):
+        try:
+            await file.export(str(dest))
+            return
+        except dagger.TransportError as exc:
+            if attempt == _CHUNK_RETRIES - 1:
+                raise
+            print(
+                f"  Export failed for {dest.name} ({exc}); retrying "
+                f"({attempt + 1}/{_CHUNK_RETRIES})...",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(2 ** attempt)
+
+
+async def export_tarball_in_chunks(
+    container: dagger.Container,
+    container_tar_path: str,
+    local_path: Path,
+) -> Path:
+    """Export a large tarball in chunks to avoid Dagger fsync deadlocks/timeouts.
+
+    The tarball is split inside the container into fixed-size pieces, each piece
+    is exported separately, and the pieces are reassembled on the host.  This
+    avoids the single multi-GB `File.export()` call that triggers
+    `Server error '502 Bad Gateway'` under Podman and BuildKit's fsutil
+    export path.
+    """
+    local_path = local_path.resolve()
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    chunk_dir = "/tmp/regicide-tarball-chunks"
+    stem = local_path.name
+
+    split_container = container.with_exec(
+        [
+            "sh",
+            "-c",
+            f"set -e; rm -rf {chunk_dir}; mkdir -p {chunk_dir}; "
+            f"split -b {CHUNK_SIZE} -a 4 -d "
+            f"{shlex.quote(container_tar_path)} "
+            f"{shlex.quote(f'{chunk_dir}/{stem}.chunk_')}",
+        ]
+    )
+
+    chunk_names = sorted(await split_container.directory(chunk_dir).entries())
+    if not chunk_names:
+        raise RuntimeError(f"no tarball chunks produced in {chunk_dir}")
+
+    chunk_files: list[Path] = []
+    for name in chunk_names:
+        local_chunk = local_path.parent / name
+        await _export_file_with_retry(split_container.file(f"{chunk_dir}/{name}"), local_chunk)
+        chunk_files.append(local_chunk)
+
+    # Reassemble on the host in a streaming fashion.
+    with local_path.open("wb") as out:
+        for chunk in chunk_files:
+            with chunk.open("rb") as src:
+                while True:
+                    data = src.read(8 * 1024 * 1024)
+                    if not data:
+                        break
+                    out.write(data)
+
+    # Clean up chunk files once the tarball is complete and verified.
+    total_size = local_path.stat().st_size
+    for chunk in chunk_files:
+        chunk.unlink()
+
+    print(f"Exported {len(chunk_files)} chunks ({total_size} bytes total) -> {local_path}")
+    return local_path
 
 
 async def main() -> None:
@@ -414,8 +563,8 @@ async def main() -> None:
     )
     parser.add_argument(
         "--qcow2-size",
-        default="30G",
-        help="Disk size for the optional QCOW2 image (default: 30G)",
+        default="20G",
+        help="Disk size for the optional QCOW2 image (default: 20G)",
     )
     parser.add_argument(
         "--qcow2-output",
@@ -461,6 +610,18 @@ async def main() -> None:
         action="store_true",
         help="Run the post-install VM smoke test after building the QCOW2 image",
     )
+    parser.add_argument(
+        "--squashfs-compression-level",
+        type=int,
+        default=15,
+        help="zstd compression level for the SquashFS image (default: 15)",
+    )
+    parser.add_argument(
+        "--squashfs-processors",
+        type=int,
+        default=4,
+        help="Number of processors mksquashfs may use (default: 4)",
+    )
     args = parser.parse_args()
 
     if args.plain:
@@ -483,6 +644,8 @@ async def main() -> None:
     out_dir = project_root / "build-system" / "arch" / "output"
     squashfs_path = out_dir / "regicide-arch.img"
 
+    _check_container_runtime()
+
     config = dagger.Config(log_output=sys.stdout)
     async with dagger.Connection(config) as client:
         if tarball_path is None:
@@ -498,9 +661,12 @@ async def main() -> None:
             tarball = client.host().file(str(tarball_path))
 
         if tarball_path is None:
-            print("Exporting stage4 tarball...")
-            tarball_path = out_dir / "regicide-arch.tar.xz"
-            await tarball.export(str(tarball_path))
+            print("Exporting stage4 tarball (chunked)...")
+            tarball_path = await export_tarball_in_chunks(
+                build_container,
+                "/var/tmp/regicide-arch.tar.xz",
+                out_dir / "regicide-arch.tar.xz",
+            )
             print(f"Output: {tarball_path}")
 
         if squashfs_input is not None:
@@ -514,7 +680,12 @@ async def main() -> None:
                 print("SquashFS input path matches output path; reusing in place.")
         else:
             print("Creating SquashFS image...")
-            iso_image = await build_iso(client, tarball)
+            iso_image = await build_iso(
+                client,
+                tarball,
+                compression_level=args.squashfs_compression_level,
+                processors=args.squashfs_processors,
+            )
             await iso_image.export(str(squashfs_path))
         print(f"Output: {squashfs_path}")
 
