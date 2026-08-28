@@ -15,6 +15,9 @@ regicide-boot-revert = "regicide_update.boot_revert:main"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
+[tool.setuptools]
+package-dir = { "" = "src" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
