@@ -83,10 +83,20 @@ def _restore_subvolume(subvol: str, target: str) -> None:
     rc.execute("btrfs", ["subvolume", "snapshot", snap_path, temp_path])
 
     # Atomic swap: old live -> backup, temp -> live, then delete backup.
-    _cleanup_existing(backup_path)
-    rc.execute("mv", [live_path, backup_path])
-    rc.execute("mv", [temp_path, live_path])
-    _cleanup_existing(backup_path)
+    try:
+        _cleanup_existing(backup_path)
+        rc.execute("mv", [live_path, backup_path])
+        rc.execute("mv", [temp_path, live_path])
+        _cleanup_existing(backup_path)
+    except SystemExit:
+        if not os.path.isdir(live_path):
+            if os.path.isdir(temp_path):
+                rc.execute("mv", [temp_path, live_path])
+            elif os.path.isdir(backup_path):
+                rc.execute("mv", [backup_path, live_path])
+        _cleanup_existing(temp_path)
+        _cleanup_existing(backup_path)
+        raise
 
 
 def apply_revert() -> bool:

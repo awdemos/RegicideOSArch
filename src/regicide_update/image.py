@@ -3,6 +3,7 @@
 
 import hashlib
 import os
+import socket
 import urllib.request
 from pathlib import Path
 from regicide_update import common as rc
@@ -15,6 +16,26 @@ def ensure_cache() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _download(url: str, dest: Path, timeout: float = 300) -> None:
+    """Download ``url`` to ``dest`` with a bounded timeout.
+
+    Uses ``urllib.request.urlretrieve`` (so callers/tests can mock it), but
+    temporarily bounds the global socket timeout so a hung connection cannot
+    block indefinitely. ``urlretrieve`` itself does not accept a ``timeout``
+    keyword, so the socket-level bound is the portable workaround.
+    """
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        urllib.request.urlretrieve(url, dest, timeout=timeout)
+    except (socket.timeout, TimeoutError, urllib.error.URLError) as e:
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        rc.die(f"Failed to download {url}: {e}")
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
 def fetch(url: str) -> Path:
     ensure_cache()
     name = os.path.basename(url)
@@ -22,7 +43,7 @@ def fetch(url: str) -> Path:
         rc.die(f"Cannot determine filename from URL: {url}")
     dest = CACHE_DIR / name
     rc.info(f"Downloading {url} ...")
-    urllib.request.urlretrieve(url, dest, timeout=300)
+    _download(url, dest, timeout=300)
     return dest
 
 
@@ -32,7 +53,7 @@ def verify_checksum(image: Path, checksum_url: str | None) -> bool:
         return True
     sum_file = CACHE_DIR / f"checksums-{image.name}.sha256"
     rc.info(f"Downloading checksums from {checksum_url} ...")
-    urllib.request.urlretrieve(checksum_url, sum_file, timeout=60)
+    _download(checksum_url, sum_file, timeout=60)
     expected: str | None = None
     with open(sum_file) as f:
         for line in f:

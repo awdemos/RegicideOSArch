@@ -55,6 +55,47 @@ else
     error "sudoers drop-in missing"
 fi
 
+# 3a. Ownership metadata (ground truth from tarball, works unprivileged).
+UNPRIVILEGED=0
+OWNER_DUMP=""
+if [[ "$(id -u)" -ne 0 ]]; then
+    UNPRIVILEGED=1
+    OWNER_DUMP="$(mktemp -p /var/tmp -t regicide-arch-owners-XXXXXX)"
+    trap 'rm -f "${OWNER_DUMP}"' EXIT
+    tar -tvf "${TARBALL}" | awk 'NF>=2 {print $0}' > "${OWNER_DUMP}"
+fi
+
+rec_owner() {
+    local p="${1#.}"  # strip leading . from tarball member path
+    if [[ "${UNPRIVILEGED}" -eq 1 ]]; then
+        awk -v member="${p#/}" '
+            {
+                # tar -tvf format: perms owner/group size date ... path
+                # Find the last field as the path.
+                path = $NF
+                if (path == member || path == "./"member) {
+                    split($2, parts, "/"); print parts[1]  # owner before /
+                }
+            }
+        ' "${OWNER_DUMP}"
+    else
+        stat -c '%U' "/${p#/}"
+    fi
+}
+
+# 3b. Ownership checks.
+for owner_check in     "/home/regicide regicide"     "/etc/hosts regicide"     "/etc/fstab regicide"     "/etc/sudoers.d root"; do
+    set -- ${owner_check}
+    path="${1}"
+    expected="${2}"
+    actual="$(rec_owner "${path}")"
+    if [[ "${actual}" == "${expected}" ]]; then
+        pass "${path} owned by ${expected}"
+    else
+        error "${path} owner '${actual}', expected '${expected}'"
+    fi
+done
+
 # 4. COSMIC session binary.
 if [[ -x "${ROOTS_DIR}/usr/bin/cosmic-session" ]]; then
     pass "cosmic-session present"
