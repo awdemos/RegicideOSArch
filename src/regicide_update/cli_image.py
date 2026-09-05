@@ -17,7 +17,6 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 def cmd_install(args: argparse.Namespace) -> None:
     path = Path(args.path)
     validation.safe_path(args.path, must_exist=True)
-    roots_mount = args.roots_mount
     validation.safe_path(args.roots_mount, must_be_absolute=True)
     if args.ab:
         from regicide_update import boot_entry
