@@ -6,7 +6,7 @@ import glob
 import os
 import subprocess
 import sys
-from regicide_update import snapshots, common as rc
+from regicide_update import snapshots, common as rc, validation
 
 
 # Kernel packages installed by the RegicideOSArch image builders
@@ -16,7 +16,7 @@ KERNEL_PACKAGES = ("linux", "linux-lts", "linux-zen", "linux-aarch64")
 
 
 def run_pacman(*args: str) -> int:
-    cmd = ["pacman"] + list(args)
+    cmd = ["pacman"] + [validation.safe_shell_arg(a) for a in args]
     rc.info("Running: " + " ".join(cmd))
     return subprocess.call(cmd)
 

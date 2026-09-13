@@ -203,8 +203,14 @@ async def build_iso(
     tarball: dagger.File,
     compression_level: int = 15,
     processors: int = 4,
-) -> dagger.File:
-    """Create a SquashFS image from a stage4 tarball for live ISO use."""
+) -> dagger.Container:
+    """Create a SquashFS image from a stage4 tarball for live ISO use.
+
+    Returns the builder container with the image at /tmp/regicide-arch.img so
+    callers can reference it in-engine or chunk-export it to the host; a
+    single multi-GB File.export() triggers '502 Bad Gateway' under
+    Podman/BuildKit, which is why the tarball export is chunked elsewhere.
+    """
 
     builder = (
         client.container()
@@ -230,7 +236,7 @@ async def build_iso(
         ])
     )
 
-    return builder.file("/tmp/regicide-arch.img")
+    return builder
 
 
 async def build_live_iso(
@@ -259,10 +265,19 @@ async def build_live_iso(
     initrd_builder = initrd_builder.with_exec(["pacman", "-S", "--noconfirm", "--needed", "dracut", "squashfs-tools"])
     initrd_builder = dagger_common.save_pacman_cache(initrd_builder, client)
 
+    # Pick the newest /lib/modules entry and require a kernel image that
+    # matches it; a kver/vmlinuz mismatch gives an unbootable ISO.
     initrd_builder = initrd_builder.with_exec([
         "sh", "-c",
-        "set -e; mkdir -p /work; kver=$(ls /lib/modules | head -1); "
-        "cp /boot/vmlinuz-linux /work/vmlinuz; "
+        "set -e; mkdir -p /work; "
+        "kver=$(ls /lib/modules | sort -V | tail -1); "
+        "if [ -f /boot/vmlinuz-${kver} ]; then "
+        "  cp /boot/vmlinuz-${kver} /work/vmlinuz; "
+        "elif [ \"$(ls /lib/modules | wc -l)\" -eq 1 ] && [ -f /boot/vmlinuz-linux ]; then "
+        "  cp /boot/vmlinuz-linux /work/vmlinuz; "
+        "else "
+        "  echo \"ERROR: no kernel image matching /lib/modules/${kver}\" >&2; exit 1; "
+        "fi; "
         "dracut --force --no-hostonly --add 'dmsquash-live' /work/initramfs.img ${kver}",
     ], insecure_root_capabilities=True)
 
@@ -507,15 +522,23 @@ async def export_tarball_in_chunks(
         await _export_file_with_retry(split_container.file(f"{chunk_dir}/{name}"), local_chunk)
         chunk_files.append(local_chunk)
 
-    # Reassemble on the host in a streaming fashion.
-    with local_path.open("wb") as out:
+    # Reassemble on the host in a streaming fashion. On failure, remove the
+    # partial output and any chunks already exported so the next run starts
+    # clean instead of reusing stale pieces.
+    try:
+        with local_path.open("wb") as out:
+            for chunk in chunk_files:
+                with chunk.open("rb") as src:
+                    while True:
+                        data = src.read(8 * 1024 * 1024)
+                        if not data:
+                            break
+                        out.write(data)
+    except BaseException:
         for chunk in chunk_files:
-            with chunk.open("rb") as src:
-                while True:
-                    data = src.read(8 * 1024 * 1024)
-                    if not data:
-                        break
-                    out.write(data)
+            chunk.unlink(missing_ok=True)
+        local_path.unlink(missing_ok=True)
+        raise
 
     # Clean up chunk files once the tarball is complete and verified.
     total_size = local_path.stat().st_size
@@ -680,13 +703,17 @@ async def main() -> None:
                 print("SquashFS input path matches output path; reusing in place.")
         else:
             print("Creating SquashFS image...")
-            iso_image = await build_iso(
+            squashfs_container = await build_iso(
                 client,
                 tarball,
                 compression_level=args.squashfs_compression_level,
                 processors=args.squashfs_processors,
             )
-            await iso_image.export(str(squashfs_path))
+            await export_tarball_in_chunks(
+                squashfs_container,
+                "/tmp/regicide-arch.img",
+                squashfs_path,
+            )
         print(f"Output: {squashfs_path}")
 
         if args.iso:
